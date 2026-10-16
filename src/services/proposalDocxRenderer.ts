@@ -3,7 +3,6 @@ import fs from 'fs/promises';
 import path from 'path';
 import axios from 'axios';
 import PizZip from 'pizzip';
-import Docxtemplater from 'docxtemplater';
 import sizeOf from 'image-size';
 import {
   AlignmentType,
@@ -15,7 +14,6 @@ import {
   Packer,
   PageOrientation,
   Paragraph,
-  ParagraphChild,
   Table,
   TableCell,
   TableRow,
@@ -27,12 +25,9 @@ import type {
   IProposal,
   IProposalPage,
   IProposalBlock,
-  ITableBlockData,
   ITableColumn,
-  ITableRow,
   HeadingLevel as HeadingLevelType,
   PageSize,
-  PageOrientation as PageOrientationType,
 } from '../model/proposal';
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -244,59 +239,6 @@ function renderList(block: IProposalBlock): Paragraph[] {
   return out;
 }
 
-async function renderImage(
-  block: IProposalBlock,
-  cacheDir?: string
-): Promise<Paragraph | null> {
-  const im = block.image!;
-  const loaded = await loadImage(im.url, cacheDir);
-  if (!loaded) {
-    return new Paragraph({
-      children: [new TextRun({ text: `[image: ${im.alt || im.url}]`, italics: true })],
-    });
-  }
-
-  // Target width default: 5 inches = 7200 twips
-  const desiredTwips = im.width
-    ? im.widthUnit === 'px'
-      ? Math.round((im.width / 96) * 1440)
-      : im.widthUnit === '%'
-        ? Math.round(7200 * (im.width / 100))
-        : 7200
-    : 7200;
-  const sized = imageSizeToTwips(loaded.width, loaded.height, desiredTwips);
-
-  const align =
-    im.align === 'left'
-      ? AlignmentType.LEFT
-      : im.align === 'right'
-        ? AlignmentType.RIGHT
-        : AlignmentType.CENTER;
-
-  const children: ParagraphChild[] = [
-    new ImageRun({
-      data: loaded.buffer,
-      transformation: { width: sized.width, height: sized.height },
-      type: loaded.type === 'jpg' ? 'jpg' : loaded.type === 'jpeg' ? 'jpg' : 'png',
-    }),
-  ];
-
-  const paras: Paragraph[] = [
-    new Paragraph({ alignment: align, children }),
-  ];
-  if (im.caption) {
-    paras.push(
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        children: [
-          new TextRun({ text: im.caption, italics: true, size: 18, color: '666666' }),
-        ],
-      })
-    );
-  }
-  return paras[0]; // caption handled below in renderBlock — see note
-}
-
 async function renderImageWithCaption(
   block: IProposalBlock,
   cacheDir?: string
@@ -446,7 +388,6 @@ function renderSignature(block: IProposalBlock): Paragraph[] {
 function renderTable(block: IProposalBlock): Table {
   const t = block.table!;
   const columns = t.columns.filter((c) => !c.hidden);
-  const visibleKeys = columns.map((c) => c.key);
 
   const headerCells = columns.map(
     (col) =>
@@ -849,7 +790,7 @@ export async function renderProposalToDocx(
   proposal: IProposal,
   options: RenderOptions
 ): Promise<RenderResult> {
-  const { templatePath, outputPath, imageCacheDir, locale } = options;
+  const { templatePath, outputPath, imageCacheDir } = options;
 
   // ── 1. Resolve pages (with legacy fallback) ───────────────────────────
   let pages: IProposalPage[] = [];

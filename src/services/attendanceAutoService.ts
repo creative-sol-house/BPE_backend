@@ -80,7 +80,8 @@ export async function markArrival(user: IUser): Promise<void> {
         department: emp.department || '',
         date: today,
         arrivalAt: now,
-        status: deriveStatus(today, now),
+        // FIX: pass `null` as the third arg (no departure yet).
+        status: deriveStatus(today, now, null),
         source: 'auto',
       });
     } catch (e: any) {
