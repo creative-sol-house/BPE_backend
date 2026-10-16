@@ -1,5 +1,5 @@
 // model/Counter.ts
-import mongoose, { Schema, Model } from 'mongoose';
+import mongoose, { Schema, Model } from 'mongoose'; 
 
 export interface ICounter {
   _id: string;

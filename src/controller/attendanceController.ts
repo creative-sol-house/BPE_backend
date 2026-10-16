@@ -16,14 +16,15 @@ import {
   deriveStatus,
   computeWorkedHours,
 } from '../utils/attendanceHelper';
+import { markAttendanceFromAuth } from '../utils/attendanceAutoMark';
 
 /* ══════════════════════════════════════════════════════════════
-   RULES live in utils/attendanceHelper.ts — single source of truth.
+   RULES re-export
    ══════════════════════════════════════════════════════════════ */
 export { ATTENDANCE_RULES };
 
 /* ══════════════════════════════════════════════════════════════
-   Allowed sort keys (whitelist to prevent slow field scans)
+   Allowed sort keys
    ══════════════════════════════════════════════════════════════ */
 const ALLOWED_SORTS = new Set([
   '-date', 'date',
@@ -68,7 +69,15 @@ export async function listAttendance(
       if (Object.keys(filter.date).length === 0) delete filter.date;
     }
 
-    if (employeeId) filter.employeeId = String(employeeId);
+    if (employeeId) {
+      const val = String(employeeId).trim();
+      if (/^[a-f\d]{24}$/i.test(val)) {
+        filter.employee = val;
+      } else {
+        filter.employeeId = val;
+      }
+    }
+
     if (department) filter.department = String(department);
 
     if (status) {
@@ -145,7 +154,6 @@ export async function getAttendance(
 
 /* ══════════════════════════════════════════════════════════════
    UPSERT ONE (admin manual override)
-   Body: { employee, date, status?, arrivalAt?, departureAt?, notes? }
    ══════════════════════════════════════════════════════════════ */
 export async function upsertAttendance(
   req: AuthRequest,
@@ -206,11 +214,6 @@ export async function upsertAttendance(
     const arr = arrivalAt ? new Date(arrivalAt) : null;
     const dep = departureAt ? new Date(departureAt) : null;
 
-    // Status derivation:
-    //  - leave / holiday → explicit override, admin wins
-    //  - arrival/departure present → derive from times
-    //  - only status → use as-is
-    //  - nothing → derive (will fall back to 'absent' on a weekday)
     let finalStatus: AttendanceStatus;
     if (status === 'leave' || status === 'holiday') {
       finalStatus = status;
@@ -266,8 +269,7 @@ export async function upsertAttendance(
 }
 
 /* ══════════════════════════════════════════════════════════════
-   UPDATE BY ID (real PATCH /:id handler)
-   Body: { status?, arrivalAt?, departureAt?, notes? }
+   UPDATE BY ID
    ══════════════════════════════════════════════════════════════ */
 export async function updateAttendanceById(
   req: AuthRequest,
@@ -290,7 +292,6 @@ export async function updateAttendanceById(
       return;
     }
 
-    // Guard: cannot edit your own attendance
     if (rec.user && String(rec.user) === String(req.user!._id)) {
       res.status(403).json({
         success: false,
@@ -344,9 +345,6 @@ export async function updateAttendanceById(
 
 /* ══════════════════════════════════════════════════════════════
    BULK MARK DAY
-   Body:
-     { date, entries: [{ employee, status?, arrivalAt?, departureAt?, notes? }, ...] }
-   Auto-generates weekend / holiday rows for anyone NOT in entries.
    ══════════════════════════════════════════════════════════════ */
 export async function bulkMarkDay(
   req: AuthRequest,
@@ -384,7 +382,6 @@ export async function bulkMarkDay(
       ? 'weekend'
       : null;
 
-    // De-dupe entries by employee id (last one wins)
     const seen = new Set<string>();
     const cleanEntries: any[] = [];
     for (let i = entries.length - 1; i >= 0; i--) {
@@ -423,11 +420,6 @@ export async function bulkMarkDay(
       const arr = entry.arrivalAt ? new Date(entry.arrivalAt) : null;
       const dep = entry.departureAt ? new Date(entry.departureAt) : null;
 
-      // Priority:
-      //   1. Explicit admin status (leave/holiday/weekend/present/...) wins
-      //   2. Times present → derive from times
-      //   3. Auto day status (weekend/holiday) as fallback
-      //   4. Derive (will end up 'absent' on a weekday with no times)
       let finalStatus: AttendanceStatus;
       if (
         entry.status === 'leave' ||
@@ -477,7 +469,6 @@ export async function bulkMarkDay(
       }
     }
 
-    // Auto-generate weekend / holiday rows for everyone else
     let autoCreated = 0;
     if (autoDayStatus) {
       const allEmployees = await Employee.find({ isDeleted: false });
@@ -507,7 +498,6 @@ export async function bulkMarkDay(
           await new Attendance(payload).save();
           autoCreated++;
         } catch (e: any) {
-          // Only swallow duplicate-key errors; log anything else.
           if (e?.code !== 11000) {
             console.error('autoCreate failed:', e);
             errors.push(`${emp.name}: ${e?.message ?? 'auto-create failed'}`);
@@ -537,8 +527,7 @@ export async function bulkMarkDay(
 }
 
 /* ══════════════════════════════════════════════════════════════
-   RECONCILE — recompute statuses for a given date.
-   Body: { date: "YYYY-MM-DD" }
+   RECONCILE
    ══════════════════════════════════════════════════════════════ */
 export async function reconcileDay(
   req: AuthRequest,
@@ -563,7 +552,6 @@ export async function reconcileDay(
 
     let changed = 0;
     for (const rec of records) {
-      // Never overwrite manual overrides.
       if (rec.status === 'leave' || rec.source === 'manual') continue;
 
       let next: AttendanceStatus;
@@ -618,7 +606,7 @@ export async function deleteAttendance(
 }
 
 /* ══════════════════════════════════════════════════════════════
-   STATS for a given day
+   STATS
    ══════════════════════════════════════════════════════════════ */
 export async function getAttendanceStats(
   req: AuthRequest,
@@ -653,6 +641,7 @@ export async function getAttendanceStats(
       leave: 0,
       holiday: 0,
       weekend: 0,
+      wfh: 0,
       unknown: 0,
     };
     let marked = 0;
@@ -696,7 +685,7 @@ export async function getAttendanceStats(
 }
 
 /* ══════════════════════════════════════════════════════════════
-   MY ATTENDANCE — self-service, paginated
+   MY ATTENDANCE
    ══════════════════════════════════════════════════════════════ */
 export async function getMyAttendance(
   req: AuthRequest,
@@ -755,7 +744,7 @@ export async function getMyAttendance(
 }
 
 /* ══════════════════════════════════════════════════════════════
-   MY TODAY — small payload for the post-login banner
+   MY TODAY
    ══════════════════════════════════════════════════════════════ */
 export async function getMyToday(
   req: AuthRequest,
@@ -801,8 +790,7 @@ export async function getMyToday(
 }
 
 /* ══════════════════════════════════════════════════════════════
-   PREVIEW — what status WOULD be computed
-   Body: { date, status?, arrivalAt?, departureAt? }
+   PREVIEW
    ══════════════════════════════════════════════════════════════ */
 export async function previewStatus(
   req: AuthRequest,
@@ -829,7 +817,6 @@ export async function previewStatus(
     const holidays = await Holiday.forDate(normalizedDate);
     const weekend = isWeekend(normalizedDate);
 
-    // Mirror upsertAttendance's priority so preview matches what would save.
     let computed: AttendanceStatus;
     if (status === 'leave' || status === 'holiday') {
       computed = status;
@@ -857,6 +844,283 @@ export async function previewStatus(
     });
   } catch (err: any) {
     console.error('previewStatus error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   EMPLOYEE MONTHLY ATTENDANCE
+   ══════════════════════════════════════════════════════════════ */
+export async function getEmployeeMonthlyAttendance(
+  req: AuthRequest,
+  res: Response
+): Promise<void> {
+  try {
+    const { employeeId } = req.params;
+    const { year, month } = req.query;
+
+    if (!year || !month) {
+      res.status(400).json({
+        success: false,
+        message: 'year and month query params are required',
+      });
+      return;
+    }
+
+    const yearNum = parseInt(String(year), 10);
+    const monthNum = parseInt(String(month), 10);
+
+    if (
+      Number.isNaN(yearNum) ||
+      Number.isNaN(monthNum) ||
+      monthNum < 0 ||
+      monthNum > 11
+    ) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid year or month (month is 0-indexed)',
+      });
+      return;
+    }
+
+    const employeeIdStr = String(employeeId);
+    const isObjectId = /^[a-f\d]{24}$/i.test(employeeIdStr);
+    const emp = await Employee.findOne(
+      isObjectId
+        ? { _id: employeeIdStr, isDeleted: false }
+        : { employeeId: employeeIdStr, isDeleted: false }
+    );
+
+    if (!emp) {
+      res.status(404).json({ success: false, message: 'Employee not found' });
+      return;
+    }
+
+    const firstDay = new Date(Date.UTC(yearNum, monthNum, 1));
+    const lastDay = new Date(Date.UTC(yearNum, monthNum + 1, 0));
+    const from = normalizeDate(firstDay);
+    const to = normalizeDate(lastDay);
+    const daysInMonth = lastDay.getUTCDate();
+
+    const records = await Attendance.find({
+      employee: emp._id,
+      date: { $gte: from, $lte: to },
+      isDeleted: false,
+    })
+      .sort({ date: 1 })
+      .populate('markedBy', 'name username');
+
+    const recordMap = new Map<string, any>();
+    records.forEach((rec) => {
+      const d = new Date(rec.date);
+      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(
+        2,
+        '0'
+      )}-${String(d.getUTCDate()).padStart(2, '0')}`;
+      recordMap.set(key, rec);
+    });
+
+    const holidays = await Holiday.find({
+      date: { $gte: from, $lte: to },
+    }).lean();
+    const holidayMap = new Map<string, string>();
+    holidays.forEach((h: any) => {
+      const d = new Date(h.date);
+      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(
+        2,
+        '0'
+      )}-${String(d.getUTCDate()).padStart(2, '0')}`;
+      holidayMap.set(key, h.name);
+    });
+
+    const days: Array<{
+      date: string;
+      dayOfWeek: number;
+      dayOfMonth: number;
+      isWeekend: boolean;
+      holidayName: string | null;
+      record: any | null;
+      status: AttendanceStatus | null;
+    }> = [];
+
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dt = new Date(Date.UTC(yearNum, monthNum, d));
+      const key = `${yearNum}-${String(monthNum + 1).padStart(2, '0')}-${String(
+        d
+      ).padStart(2, '0')}`;
+      const dow = dt.getUTCDay();
+      const weekend = dow === 0 || dow === 6;
+      const holidayName = holidayMap.get(key) || null;
+      const record = recordMap.get(key) || null;
+
+      let status: AttendanceStatus | null = record?.status ?? null;
+      if (!status) {
+        if (holidayName) status = 'holiday';
+        else if (weekend) status = 'weekend';
+      }
+
+      days.push({
+        date: key,
+        dayOfWeek: dow,
+        dayOfMonth: d,
+        isWeekend: weekend,
+        holidayName,
+        record: record
+          ? {
+              _id: record._id,
+              status: record.status,
+              arrivalAt: record.arrivalAt,
+              departureAt: record.departureAt,
+              workedHours: record.workedHours,
+              notes: record.notes,
+              source: record.source,
+              markedBy: record.markedBy,
+            }
+          : null,
+        status,
+      });
+    }
+
+    const summary = {
+      totalDays: daysInMonth,
+      workingDays: days.filter((d) => !d.isWeekend && !d.holidayName).length,
+      present: days.filter((d) => d.status === 'present').length,
+      late: days.filter((d) => d.status === 'late').length,
+      halfDay: days.filter((d) => d.status === 'half_day').length,
+      leave: days.filter((d) => d.status === 'leave').length,
+      absent: days.filter((d) => d.status === 'absent').length,
+      holiday: days.filter((d) => d.status === 'holiday').length,
+      weekend: days.filter((d) => d.status === 'weekend').length,
+      wfh: days.filter((d) => d.status === 'wfh').length,
+      marked: days.filter((d) => d.record !== null).length,
+      totalWorkedHours: days.reduce(
+        (sum, d) => sum + (d.record?.workedHours || 0),
+        0
+      ),
+    };
+
+    res.json({
+      success: true,
+      data: {
+        employee: {
+          _id: emp._id,
+          name: emp.name,
+          employeeId: emp.employeeId,
+          department: emp.department || '',
+          designation: emp.designation || '',
+        },
+        year: yearNum,
+        month: monthNum,
+        monthLabel: new Date(yearNum, monthNum).toLocaleDateString('en-US', {
+          month: 'long',
+          year: 'numeric',
+        }),
+        from,
+        to,
+        days,
+        summary,
+      },
+    });
+  } catch (err: any) {
+    console.error('getEmployeeMonthlyAttendance error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   AUTO CHECK-IN / CHECK-OUT
+   ══════════════════════════════════════════════════════════════ */
+
+/**
+ * POST /attendance/check-in
+ * Called after successful login. Only the FIRST call of the day
+ * creates the record; every other call is a no-op.
+ */
+export async function checkIn(req: AuthRequest, res: Response): Promise<void> {
+  try {
+    if (!req.user) {
+      res.status(401).json({ success: false, message: 'Not authenticated' });
+      return;
+    }
+
+    const result = await markAttendanceFromAuth(req.user._id, 'login');
+
+    if (result.reason === 'no-employee') {
+      res.status(404).json({
+        success: false,
+        message: 'No employee record linked to your account',
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      action: result.action,
+      reason: result.reason,
+      data: result.record,
+    });
+  } catch (err: any) {
+    // Race: two simultaneous logins both saw "no row" and both tried
+    // to insert. Unique index rejects the second. Return the winner.
+    if (err?.code === 11000) {
+      try {
+        const emp = await Employee.findOne({
+          user: req.user!._id,
+          isDeleted: false,
+        });
+        const rec = emp
+          ? await Attendance.findOne({
+              employee: emp._id,
+              date: normalizeDate(new Date()),
+            })
+          : null;
+
+        res.json({
+          success: true,
+          action: 'skipped',
+          reason: 'already-marked-today',
+          data: rec,
+        });
+        return;
+      } catch {
+        /* fall through to 500 */
+      }
+    }
+    console.error('checkIn error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+}
+
+/**
+ * POST /attendance/check-out
+ * Called on logout. Updates departureAt, workedHours, status.
+ * Never touches arrivalAt.
+ */
+export async function checkOut(req: AuthRequest, res: Response): Promise<void> {
+  try {
+    if (!req.user) {
+      res.status(401).json({ success: false, message: 'Not authenticated' });
+      return;
+    }
+
+    const result = await markAttendanceFromAuth(req.user._id, 'logout');
+
+    if (result.reason === 'no-employee') {
+      res.status(404).json({
+        success: false,
+        message: 'No employee record linked to your account',
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      action: result.action,
+      reason: result.reason,
+      data: result.record,
+    });
+  } catch (err: any) {
+    console.error('checkOut error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
 }

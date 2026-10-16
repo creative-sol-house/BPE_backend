@@ -303,7 +303,7 @@ clientSchema.virtual('primaryContact').get(function () {
   if (!this.contacts?.length) return null;
   return this.contacts.find((c) => c.isPrimary) ?? this.contacts[0] ?? null;
 });
-
+ 
 clientSchema.virtual('billingAddress').get(function () {
   if (!this.addresses?.length) return null;
   return (

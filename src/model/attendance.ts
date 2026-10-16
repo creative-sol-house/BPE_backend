@@ -2,29 +2,17 @@
 import mongoose, { Document, Schema, Types, Model } from 'mongoose';
 
 export type AttendanceStatus =
-  | 'present'
-  | 'absent'
-  | 'late'
-  | 'half_day'
-  | 'leave'
-  | 'holiday'
-  | 'weekend';
+  | 'present' | 'absent' | 'late' | 'half_day' | 'leave'
+  | 'holiday' | 'weekend'
+  | 'wfh';                       // ← add
 
 export const ATTENDANCE_STATUSES: AttendanceStatus[] = [
-  'present',
-  'absent',
-  'late',
-  'half_day',
-  'leave',
-  'holiday',
-  'weekend',
+  'present', 'absent', 'late', 'half_day', 'leave', 'holiday', 'weekend',
+  'wfh',                         // ← add
 ];
 
-/** Statuses that count as "the employee was at work". */
 export const ATTENDED_STATUSES: AttendanceStatus[] = [
-  'present',
-  'late',
-  'half_day',
+  'present', 'late', 'half_day', 'wfh',   // ← add wfh so it counts as "at work"
 ];
 
 export interface IAttendance extends Document {

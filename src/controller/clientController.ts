@@ -436,6 +436,71 @@ export async function listClients(req: AuthRequest, res: Response): Promise<void
     res.status(500).json({ success: false, message: err.message });
   }
 }
+// ═════════════════════════════════════════════════════════════════════════
+// LIST CLIENT OPTIONS (lightweight, for dropdowns)
+//   GET /api/clients/options
+//
+// Returns only the fields a picker needs — no contacts, addresses,
+// bank accounts, etc. Much lighter than `listClients`.
+// ═════════════════════════════════════════════════════════════════════════
+export async function listClientOptions(
+  req: AuthRequest,
+  res: Response
+): Promise<void> {
+  try {
+    const { search, status, clientType, limit = '100' } = req.query;
+
+    const filter: any = { isDeleted: false };
+
+    // Search across name + clientId (case-insensitive)
+    if (search) {
+      filter.$or = [
+        { name: { $regex: String(search), $options: 'i' } },
+        { clientId: { $regex: String(search), $options: 'i' } },
+        { displayName: { $regex: String(search), $options: 'i' } },
+      ];
+    }
+
+    if (clientType) {
+      if (!CLIENT_TYPES.includes(clientType as ClientType)) {
+        res.status(400).json({
+          success: false,
+          message: `Invalid clientType. Allowed: ${CLIENT_TYPES.join(', ')}`,
+        });
+        return;
+      }
+      filter.clientType = clientType;
+    }
+
+    // status: single value or comma-separated list
+    if (status) {
+      const list = String(status)
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s): s is ClientStatus =>
+          (CLIENT_STATUSES as string[]).includes(s)
+        );
+      if (list.length === 1) filter.status = list[0];
+      else if (list.length > 1) filter.status = { $in: list };
+    }
+
+    const limitNum = Math.min(
+      500,
+      Math.max(1, parseInt(String(limit), 10) || 100)
+    );
+
+    const clients = await Client.find(filter)
+      .select('_id clientId name clientType status')
+      .sort('name')
+      .limit(limitNum)
+      .lean();
+
+    res.json({ success: true, data: clients });
+  } catch (err: any) {
+    console.error('listClientOptions error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+}
 
 // ─── Get Client By ID ─────────────────────────────────────────────────────
 export async function getClient(req: AuthRequest, res: Response): Promise<void> {

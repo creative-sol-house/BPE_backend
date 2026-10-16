@@ -2,125 +2,95 @@
 import type { AttendanceStatus } from '../model/attendance';
 
 /* ══════════════════════════════════════════════════════════════
-   BUSINESS TIMEZONE
-   All "dates" in the system are UTC-midnight Date objects that
-   represent a *calendar day in the business timezone*. Set the
-   offset (in minutes) via env var. Default: UTC+5 (Pakistan).
+   RULES — single source of truth
    ══════════════════════════════════════════════════════════════ */
-const TZ_OFFSET_MINUTES = Number(
-  process.env.BUSINESS_TZ_OFFSET_MINUTES ?? 300 // +05:00
-);
-
 export const ATTENDANCE_RULES = {
-  weekendDays: [0] as number[],
-  shiftStartHour: 9,
-  shiftStartMinute: 0,
-  lateGraceMinutes: 15,
-  halfDayAfterHour: 13,
-  halfDayMinHours: 4,
+  /** Anything after this local time counts as late (24h, local tz). */
+  LATE_AFTER_HOUR: 9,
+  LATE_AFTER_MINUTE: 30,
+  /** Worked-hours below this → half_day. */
+  HALF_DAY_HOURS: 4,
+  /** Worked-hours at/above this → full present. */
+  FULL_DAY_HOURS: 8,
+  /** Weekend days (0 = Sunday, 6 = Saturday). */
+  WEEKEND_DAYS: [0, 6] as number[],
 };
 
-/**
- * Normalizes any date-ish input into a UTC-midnight Date that
- * represents the calendar day in the BUSINESS timezone.
- *
- * Example (offset = +5h):
- *   2024-03-19T22:30:00Z  →  2024-03-20T00:00:00Z  (next day in PKT)
- *   2024-03-19T02:00:00Z  →  2024-03-19T00:00:00Z
- */
-export function normalizeDate(d: Date | string): Date {
-  const date = new Date(d);
-  if (Number.isNaN(date.getTime())) return new Date(NaN);
+/* ══════════════════════════════════════════════════════════════
+   Date helpers — all use UTC to stay consistent with Mongo.
+   ══════════════════════════════════════════════════════════════ */
 
-  const shifted = new Date(date.getTime() + TZ_OFFSET_MINUTES * 60_000);
+/** Normalize any date-like value to UTC midnight of that day. */
+export function normalizeDate(input: Date | string): Date {
+  const d = input instanceof Date ? input : new Date(input);
   return new Date(
-    Date.UTC(
-      shifted.getUTCFullYear(),
-      shifted.getUTCMonth(),
-      shifted.getUTCDate()
-    )
+    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
   );
 }
 
-/**
- * Strict YYYY-MM-DD validator. Rejects 2024-13-99, 2024-02-30,
- * trailing garbage, and non-strings. Round-trips through Date to
- * catch impossible calendar days.
- */
-export function isValidISODate(s: unknown): boolean {
-  if (typeof s !== 'string') return false;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
-  const d = new Date(s + 'T00:00:00.000Z');
-  if (Number.isNaN(d.getTime())) return false;
-  return d.toISOString().startsWith(s);
+/** Strict YYYY-MM-DD check. */
+export function isValidISODate(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const d = new Date(value + 'T00:00:00.000Z');
+  return !Number.isNaN(d.getTime());
 }
 
-/**
- * Weekend check against the BUSINESS timezone day.
- * Assumes `d` is already a UTC-midnight normalized date.
- */
-export function isWeekend(d: Date): boolean {
-  // Since d is UTC-midnight of the business day, getUTCDay() is the
-  // correct weekday for that business day.
-  return ATTENDANCE_RULES.weekendDays.includes(d.getUTCDay());
+/** True when the date falls on a configured weekend day. */
+export function isWeekend(date: Date): boolean {
+  return ATTENDANCE_RULES.WEEKEND_DAYS.includes(date.getUTCDay());
 }
 
+/* ══════════════════════════════════════════════════════════════
+   Time helpers
+   ══════════════════════════════════════════════════════════════ */
+
+/** Round to 2 decimals of hours: 1h 30m → 1.5 */
 export function computeWorkedHours(
-  arrivalAt?: Date | null,
-  departureAt?: Date | null
+  arrival: Date | null | undefined,
+  departure: Date | null | undefined
 ): number {
-  if (!arrivalAt || !departureAt) return 0;
-  const ms = departureAt.getTime() - arrivalAt.getTime();
+  if (!arrival || !departure) return 0;
+  const ms = departure.getTime() - arrival.getTime();
   if (ms <= 0) return 0;
-  return +((ms / (1000 * 60 * 60)).toFixed(2));
+  return Math.round((ms / 3_600_000) * 100) / 100;
 }
 
-/**
- * Derives an attendance status from times. Does NOT check holidays —
- * callers are responsible for that (they have DB access).
- *
- * Priority:
- *   1. Weekend → 'weekend'
- *   2. No arrival → 'absent'
- *   3. Arrived after halfDayAfterHour → 'half_day'
- *   4. Worked < halfDayMinHours → 'half_day'
- *   5. Arrived after grace → 'late'
- *   6. Otherwise → 'present'
- */
+/* ══════════════════════════════════════════════════════════════
+   Status derivation
+   ══════════════════════════════════════════════════════════════ */
 export function deriveStatus(
   date: Date,
-  arrivalAt?: Date | null,
-  departureAt?: Date | null
+  arrival: Date | null | undefined,
+  departure: Date | null | undefined
 ): AttendanceStatus {
-  if (isWeekend(date)) return 'weekend';
-  if (!arrivalAt) return 'absent';
+  // No times → absent on a weekday.
+  if (!arrival && !departure) return 'absent';
 
-  // Build shift boundaries in the business timezone, then express
-  // them as UTC instants so they compare correctly against arrivalAt
-  // (which is a real UTC timestamp).
-  const shiftStart = new Date(
-    date.getTime() +
-      ATTENDANCE_RULES.shiftStartHour * 3_600_000 +
-      ATTENDANCE_RULES.shiftStartMinute * 60_000 -
-      TZ_OFFSET_MINUTES * 60_000
-  );
+  // Late?
+  if (arrival) {
+    const lateCutoff = new Date(date);
+    lateCutoff.setUTCHours(
+      ATTENDANCE_RULES.LATE_AFTER_HOUR,
+      ATTENDANCE_RULES.LATE_AFTER_MINUTE,
+      0,
+      0
+    );
+    if (arrival.getTime() > lateCutoff.getTime()) {
+      // Late — but still check if they only worked half a day.
+      const hrs = computeWorkedHours(arrival, departure);
+      if (departure && hrs > 0 && hrs < ATTENDANCE_RULES.HALF_DAY_HOURS) {
+        return 'half_day';
+      }
+      return 'late';
+    }
+  }
 
-  const grace = new Date(
-    shiftStart.getTime() + ATTENDANCE_RULES.lateGraceMinutes * 60_000
-  );
-
-  const halfDayBoundary = new Date(
-    date.getTime() +
-      ATTENDANCE_RULES.halfDayAfterHour * 3_600_000 -
-      TZ_OFFSET_MINUTES * 60_000
-  );
-
-  const workedHours = computeWorkedHours(arrivalAt, departureAt);
-
-  if (arrivalAt >= halfDayBoundary) return 'half_day';
-  if (departureAt && workedHours > 0 && workedHours < ATTENDANCE_RULES.halfDayMinHours) {
+  // Worked hours bucket.
+  const hrs = computeWorkedHours(arrival, departure);
+  if (departure && hrs > 0 && hrs < ATTENDANCE_RULES.HALF_DAY_HOURS) {
     return 'half_day';
   }
-  if (arrivalAt > grace) return 'late';
+
   return 'present';
 }

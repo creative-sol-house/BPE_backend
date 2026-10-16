@@ -26,7 +26,12 @@ clientRouter.get(
   clientController.getPaymentTermOptions
 );
 
-
+// ─── Lightweight options (for dropdowns / pickers) ───────────────────────
+clientRouter.get(
+  '/options',
+  authorize('clients', 'view'),
+  clientController.listClientOptions
+);
 
 // ═════════════════════════════════════════════════════════════════════════
 // GENERIC LIST / CREATE

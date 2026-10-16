@@ -1,4 +1,4 @@
-// route/attendanceRoute.ts
+// routes/attendanceRoutes.ts
 import { Router } from 'express';
 import * as attendanceController from '../controller/attendanceController';
 import { authenticate } from '../middleware/auth';
@@ -9,8 +9,16 @@ const router = Router();
 router.use(authenticate);
 
 // ── Self-service ─────────────────────────────────────────────────
-router.get('/me',    attendanceController.getMyAttendance);
+router.get('/me', attendanceController.getMyAttendance);
 router.get('/today', attendanceController.getMyToday);
+
+/**
+ * Auto attendance from login/logout.
+ * No `authorize()` needed — every authenticated user marks their own
+ * attendance. The controller resolves the Employee from req.user._id.
+ */
+router.post('/check-in', attendanceController.checkIn);
+router.post('/check-out', attendanceController.checkOut);
 
 // ── Admin ────────────────────────────────────────────────────────
 router.get(
@@ -47,6 +55,14 @@ router.post(
   '/reconcile',
   authorize('attendance', 'edit'),
   attendanceController.reconcileDay
+);
+
+// ── Dedicated employee monthly view ──────────────────────────────
+// IMPORTANT: this MUST come before '/:id'
+router.get(
+  '/employee/:employeeId/monthly',
+  authorize('attendance', 'view'),
+  attendanceController.getEmployeeMonthlyAttendance
 );
 
 router.get(

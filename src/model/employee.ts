@@ -7,6 +7,11 @@ export type Gender = 'male' | 'female';
 export type EmploymentStatus =
   | 'active' | 'on_leave' | 'suspended' | 'resigned' | 'terminated';
 
+// ─── Salary structure ─────────────────────────────────────────────────────
+export type SalaryStructure = 'fixed' | 'piece_rate';
+
+export const SALARY_STRUCTURES: SalaryStructure[] = ['fixed', 'piece_rate'];
+
 // ─── Leave types ──────────────────────────────────────────────────────────
 export type LeaveType = string;
 
@@ -55,6 +60,12 @@ export interface IEmployee extends Document {
 
   standardCheckIn: string;
   standardCheckOut: string;
+
+  // ── Salary ──────────────────────────────────────────────────────────────
+  salaryStructure: SalaryStructure;
+  basicSalary: number;
+  pieceRateSalary: number;
+  overtimePerHourAmount: number;
 
   leaveSchedules: ILeaveSchedule[];
   leaveAllocations: ILeaveAllocation[];
@@ -239,6 +250,18 @@ const employeeSchema = new Schema<IEmployee, IEmployeeModel>(
       match: [TIME_RE, 'standardCheckOut must be in HH:mm (24h) format'],
     },
 
+    // ── Salary ────────────────────────────────────────────────────────────
+    salaryStructure: {
+      type: String,
+      enum: SALARY_STRUCTURES,
+      default: 'fixed',
+      required: true,
+      index: true,
+    },
+    basicSalary: { type: Number, default: 0, min: 0 },
+    pieceRateSalary: { type: Number, default: 0, min: 0 },
+    overtimePerHourAmount: { type: Number, default: 0, min: 0 },
+
     leaveSchedules: {
       type: [leaveScheduleSchema],
       default: [],
@@ -300,6 +323,7 @@ employeeSchema.index({ standardCheckIn: 1, standardCheckOut: 1 });
 employeeSchema.index({ 'leaveAllocations.year': 1, 'leaveAllocations.month': 1 });
 employeeSchema.index({ 'leaveAllocations.type': 1 });
 employeeSchema.index({ 'leaveSchedules.type': 1 });
+employeeSchema.index({ salaryStructure: 1, isDeleted: 1 });
 
 // ─── Virtuals ─────────────────────────────────────────────────────────────
 employeeSchema.virtual('hasUserAccount').get(function () {

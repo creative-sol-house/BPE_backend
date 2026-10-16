@@ -34,12 +34,21 @@ emprouter.post(
 );
 
 // ─── Generic list / create ───────────────────────────────────────────────
+// Query params supported by the list endpoint:
+//   ?department=  ?designation=  ?isActive=  ?employmentStatus=
+//   ?hasUserAccount=  ?salaryStructure=fixed|piece_rate  ?search=
+//   ?page=  ?limit=  ?sort=
 emprouter.get(
   '/',
   authorize('employees', 'view'),
   employeeController.listEmployees
 );
 
+// Body accepts the salary fields:
+//   salaryStructure: 'fixed' | 'piece_rate'
+//   basicSalary: number
+//   pieceRateSalary: number
+//   overtimePerHourAmount: number
 emprouter.post(
   '/',
   authorize('employees', 'add'),
@@ -53,6 +62,8 @@ emprouter.get(
   employeeController.getEmployee
 );
 
+// Body accepts the same salary fields as create, plus every other
+// employee field. Salary fields are optional and preserved if omitted.
 emprouter.patch(
   '/:employeeId',
   authorize('employees', 'edit'),

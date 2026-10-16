@@ -4,10 +4,12 @@ import mongoose from 'mongoose';
 import Employee, {
   ACTIVE_STATUSES,
   EMPLOYMENT_STATUSES,
+  SALARY_STRUCTURES,
   expandScheduleToMonths,
   type EmploymentStatus,
   type ILeaveAllocation,
   type ILeaveSchedule,
+  type SalaryStructure,
 } from '../model/employee';
 import User from '../model/user';
 import Role from '../model/role';
@@ -37,6 +39,99 @@ function validateTimings(checkIn?: string, checkOut?: string): string | null {
     }
   }
   return null;
+}
+
+// ─── Salary validation ────────────────────────────────────────────────────
+interface ParsedSalary {
+  salaryStructure: SalaryStructure;
+  basicSalary: number;
+  pieceRateSalary: number;
+  overtimePerHourAmount: number;
+}
+
+/**
+ * Validate the four salary fields. All four are optional at the input
+ * level — when a field is omitted we fall back to the existing value
+ * (for updates) or the schema default (for creates).
+ */
+function validateSalaryInput(
+  input: {
+    salaryStructure?: any;
+    basicSalary?: any;
+    pieceRateSalary?: any;
+    overtimePerHourAmount?: any;
+  },
+  fallback?: Partial<ParsedSalary>
+): { ok: boolean; error?: string; parsed: Partial<ParsedSalary> } {
+  const parsed: Partial<ParsedSalary> = {};
+
+  if (input.salaryStructure !== undefined) {
+    const s = String(input.salaryStructure).trim();
+    if (!(SALARY_STRUCTURES as string[]).includes(s)) {
+      return {
+        ok: false,
+        error: `salaryStructure must be one of: ${SALARY_STRUCTURES.join(', ')}`,
+        parsed,
+      };
+    }
+    parsed.salaryStructure = s as SalaryStructure;
+  } else if (fallback?.salaryStructure !== undefined) {
+    parsed.salaryStructure = fallback.salaryStructure;
+  }
+
+  const parseMoney = (
+    raw: any,
+    label: string
+  ): { ok: true; value: number } | { ok: false; error: string } => {
+    if (raw === undefined || raw === null || raw === '') {
+      return { ok: true, value: NaN }; // sentinel — caller decides
+    }
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) {
+      return { ok: false, error: `${label} must be a non-negative number` };
+    }
+    return { ok: true, value: +n.toFixed(2) };
+  };
+
+  if (input.basicSalary !== undefined) {
+    const r = parseMoney(input.basicSalary, 'basicSalary');
+    if (!r.ok) return { ok: false, error: r.error, parsed };
+    parsed.basicSalary = r.value;
+  } else if (fallback?.basicSalary !== undefined) {
+    parsed.basicSalary = fallback.basicSalary;
+  }
+
+  if (input.pieceRateSalary !== undefined) {
+    const r = parseMoney(input.pieceRateSalary, 'pieceRateSalary');
+    if (!r.ok) return { ok: false, error: r.error, parsed };
+    parsed.pieceRateSalary = r.value;
+  } else if (fallback?.pieceRateSalary !== undefined) {
+    parsed.pieceRateSalary = fallback.pieceRateSalary;
+  }
+
+  if (input.overtimePerHourAmount !== undefined) {
+    const r = parseMoney(input.overtimePerHourAmount, 'overtimePerHourAmount');
+    if (!r.ok) return { ok: false, error: r.error, parsed };
+    parsed.overtimePerHourAmount = r.value;
+  } else if (fallback?.overtimePerHourAmount !== undefined) {
+    parsed.overtimePerHourAmount = fallback.overtimePerHourAmount;
+  }
+
+  // Cross-field: for a fixed employee basicSalary should be > 0, for
+  // piece-rate pieceRateSalary should be > 0. Only enforce when the
+  // structure itself is being set or the amount is being set.
+  const struct = parsed.salaryStructure ?? fallback?.salaryStructure;
+  const basic = parsed.basicSalary ?? fallback?.basicSalary;
+  const piece = parsed.pieceRateSalary ?? fallback?.pieceRateSalary;
+
+  if (struct === 'fixed' && typeof basic === 'number' && basic === 0) {
+    // Not an error — allow zero for now — but a caller could add a warning.
+  }
+  if (struct === 'piece_rate' && typeof piece === 'number' && piece === 0) {
+    // Not an error — allow zero for now.
+  }
+
+  return { ok: true, parsed };
 }
 
 // ─── Leave schedule validation (the "ranges" HR types) ────────────────────
@@ -111,7 +206,6 @@ function validateLeaveSchedules(input: any): {
       };
     }
 
-    // Optional end. If both are missing → continue (open-ended)
     let endYear: number | undefined;
     let endMonth: number | undefined;
     const rawEndY = raw.endYear;
@@ -197,7 +291,6 @@ function expandAndMerge(
     const rows = expandScheduleToMonths(asSchedule, fallbackEndYear);
 
     for (const r of rows) {
-      // Preserve existing used / carriedForward if the row already exists
       const prev = existing.find(
         (a) =>
           a.type.trim().toLowerCase() === r.type.trim().toLowerCase() &&
@@ -237,6 +330,11 @@ export async function createEmployee(req: AuthRequest, res: Response): Promise<v
       // ─── standard timings ───
       standardCheckIn,
       standardCheckOut,
+      // ─── salary ───
+      salaryStructure,
+      basicSalary,
+      pieceRateSalary,
+      overtimePerHourAmount,
       // ─── leave schedule RANGES ───
       leaveSchedules,
       // ─── user-only ───
@@ -277,8 +375,20 @@ export async function createEmployee(req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // ── 1c. Validate leave schedules and expand to monthly rows ──────────
-    // 👇 No seeding — if HR sends nothing, employee starts with zero leaves.
+    // ── 1c. Validate salary fields ───────────────────────────────────────
+    const salaryRes = validateSalaryInput({
+      salaryStructure,
+      basicSalary,
+      pieceRateSalary,
+      overtimePerHourAmount,
+    });
+    if (!salaryRes.ok) {
+      res.status(400).json({ success: false, message: salaryRes.error });
+      return;
+    }
+    const parsedSalary = salaryRes.parsed;
+
+    // ── 1d. Validate leave schedules and expand to monthly rows ──────────
     const leaveRes = validateLeaveSchedules(leaveSchedules);
     if (!leaveRes.ok) {
       res.status(400).json({ success: false, message: leaveRes.error });
@@ -346,7 +456,6 @@ export async function createEmployee(req: AuthRequest, res: Response): Promise<v
         return;
       }
 
-      // Permission escalation check
       if (permissions && permissions.length && !req.user!.isMainAdmin) {
         for (const p of permissions) {
           for (const a of p.actions) {
@@ -361,7 +470,6 @@ export async function createEmployee(req: AuthRequest, res: Response): Promise<v
         }
       }
 
-      // Validate role/department
       let roleDoc: any = null;
       if (roleId) {
         roleDoc = await Role.findOne({
@@ -413,16 +521,33 @@ export async function createEmployee(req: AuthRequest, res: Response): Promise<v
         createdBy: req.user!._id,
       });
 
-      await user.save(); // hook auto-creates Employee
+        await user.save(); // hook auto-creates Employee
 
-      const employee = await Employee.findOne({
-        user: user._id,
-        isDeleted: false,
-      });
+      // Poll briefly — Mongoose does NOT await post('save') hooks,
+      // so the Employee record may not exist yet.
+      let employee: any = null;
+      for (let i = 0; i < 20; i++) {
+        employee = await Employee.findOne({
+          user: user._id,
+          isDeleted: false,
+        });
+        if (employee) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
 
       if (employee) {
         if (standardCheckIn !== undefined) employee.standardCheckIn = standardCheckIn;
         if (standardCheckOut !== undefined) employee.standardCheckOut = standardCheckOut;
+
+        // ── Salary fields ────────────────────────────────────────────
+        if (parsedSalary.salaryStructure !== undefined)
+          employee.salaryStructure = parsedSalary.salaryStructure;
+        if (parsedSalary.basicSalary !== undefined)
+          employee.basicSalary = parsedSalary.basicSalary;
+        if (parsedSalary.pieceRateSalary !== undefined)
+          employee.pieceRateSalary = parsedSalary.pieceRateSalary;
+        if (parsedSalary.overtimePerHourAmount !== undefined)
+          employee.overtimePerHourAmount = parsedSalary.overtimePerHourAmount;
 
         employee.leaveSchedules = parsedSchedules as ILeaveSchedule[];
         employee.leaveAllocations = expandedAllocations;
@@ -457,6 +582,12 @@ export async function createEmployee(req: AuthRequest, res: Response): Promise<v
 
       standardCheckIn: standardCheckIn || '09:00',
       standardCheckOut: standardCheckOut || '18:00',
+
+      // ── Salary ────────────────────────────────────────────────────
+      salaryStructure: parsedSalary.salaryStructure ?? 'fixed',
+      basicSalary: parsedSalary.basicSalary ?? 0,
+      pieceRateSalary: parsedSalary.pieceRateSalary ?? 0,
+      overtimePerHourAmount: parsedSalary.overtimePerHourAmount ?? 0,
 
       leaveSchedules: parsedSchedules,
       leaveAllocations: expandedAllocations,
@@ -498,6 +629,7 @@ export async function listEmployees(req: AuthRequest, res: Response): Promise<vo
       isActive,
       employmentStatus,
       hasUserAccount,
+      salaryStructure,
       search,
       page = '1',
       limit = '20',
@@ -509,6 +641,13 @@ export async function listEmployees(req: AuthRequest, res: Response): Promise<vo
     if (department) filter.department = department;
     if (designation) filter.designation = designation;
     if (isActive !== undefined) filter.isActive = isActive === 'true';
+
+    if (salaryStructure) {
+      const s = String(salaryStructure).trim();
+      if ((SALARY_STRUCTURES as string[]).includes(s)) {
+        filter.salaryStructure = s;
+      }
+    }
 
     if (hasUserAccount !== undefined) {
       filter.user = hasUserAccount === 'true' ? { $ne: null } : null;
@@ -596,7 +735,6 @@ export async function getEmployee(req: AuthRequest, res: Response): Promise<void
 
     const payload: any = employee.toJSON();
 
-    // Optional live recompute from attendance: ?live=true[&from=&to=]
     if (String(live) === 'true') {
       const fromDate = from ? new Date(String(from)) : undefined;
       const toDate = to ? new Date(String(to)) : undefined;
@@ -702,10 +840,16 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
       statusReason,
       isActive,
 
+      // ── salary ────────────────────────────────────────────────────────
+      salaryStructure,
+      basicSalary,
+      pieceRateSalary,
+      overtimePerHourAmount,
+
       // ONLY these two are editable for timings
       standardCheckIn,
       standardCheckOut,
-      refreshTotalWorkingHours, // optional: force recompute from attendance
+      refreshTotalWorkingHours,
 
       // leave schedule RANGES (full replace)
       leaveSchedules,
@@ -731,7 +875,6 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
       ? await User.findOne({ _id: employee.user, isDeleted: false })
       : null;
 
-    // ── Permission check ────────────────────────────────────────────────
     const isMainAdmin = req.user!.isMainAdmin;
     const canEditOthers = await req.user!.can('employees', 'edit');
 
@@ -934,7 +1077,6 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
       }
     }
 
-    // Validate timing edits
     const timingError = validateTimings(
       standardCheckIn !== undefined ? standardCheckIn : employee.standardCheckIn,
       standardCheckOut !== undefined ? standardCheckOut : employee.standardCheckOut
@@ -944,7 +1086,28 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // Validate & expand leave schedules
+    // ── Salary validation ────────────────────────────────────────────────
+    const salaryRes = validateSalaryInput(
+      {
+        salaryStructure,
+        basicSalary,
+        pieceRateSalary,
+        overtimePerHourAmount,
+      },
+      {
+        salaryStructure: employee.salaryStructure,
+        basicSalary: employee.basicSalary,
+        pieceRateSalary: employee.pieceRateSalary,
+        overtimePerHourAmount: employee.overtimePerHourAmount,
+      }
+    );
+    if (!salaryRes.ok) {
+      res.status(400).json({ success: false, message: salaryRes.error });
+      return;
+    }
+    const parsedSalary = salaryRes.parsed;
+
+    // ── Leave schedules ──────────────────────────────────────────────────
     let parsedSchedules: ParsedSchedule[] | undefined;
     let expandedAllocations: ILeaveAllocation[] | undefined;
     if (leaveSchedules !== undefined) {
@@ -961,7 +1124,7 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
       );
     }
 
-    // Uniqueness against other users (only when email is changing)
+    // ── Uniqueness checks ────────────────────────────────────────────────
     if (email !== undefined && email !== employee.email) {
       const normalized = String(email).trim().toLowerCase();
 
@@ -993,7 +1156,6 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
       }
     }
 
-    // CNIC uniqueness (only when linked)
     if (cnic !== undefined && cnic !== employee.cnic && linkedUser) {
       const dupUser = await User.findOne({ _id: { $ne: linkedUser._id }, cnic });
       if (dupUser) {
@@ -1005,7 +1167,6 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
       }
     }
 
-    // Department validation
     if (
       department !== undefined &&
       linkedUser &&
@@ -1029,7 +1190,7 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
       }
     }
 
-    // ── Apply changes to Employee ───────────────────────────────────────
+    // ── Apply changes ───────────────────────────────────────────────────
     if (name !== undefined) employee.name = name;
     if (phoneNo !== undefined) employee.phoneNo = phoneNo;
     if (address !== undefined) employee.address = address;
@@ -1042,11 +1203,19 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
     if (dateOfJoining !== undefined) employee.dateOfJoining = dateOfJoining;
     if (profileImage !== undefined) employee.profileImage = profileImage;
 
-    // Only the two timing strings are editable.
+    // ── Salary fields ────────────────────────────────────────────────────
+    if (parsedSalary.salaryStructure !== undefined)
+      employee.salaryStructure = parsedSalary.salaryStructure;
+    if (parsedSalary.basicSalary !== undefined)
+      employee.basicSalary = parsedSalary.basicSalary;
+    if (parsedSalary.pieceRateSalary !== undefined)
+      employee.pieceRateSalary = parsedSalary.pieceRateSalary;
+    if (parsedSalary.overtimePerHourAmount !== undefined)
+      employee.overtimePerHourAmount = parsedSalary.overtimePerHourAmount;
+
     if (standardCheckIn !== undefined) employee.standardCheckIn = standardCheckIn;
     if (standardCheckOut !== undefined) employee.standardCheckOut = standardCheckOut;
 
-    // Replace the leave schedule + allocation list atomically
     if (parsedSchedules !== undefined) {
       employee.leaveSchedules = parsedSchedules as ILeaveSchedule[];
       employee.leaveAllocations = expandedAllocations ?? [];
@@ -1072,7 +1241,6 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
 
     await employee.save();
 
-    // Optional: refresh cached total from attendance (server-triggered only)
     if (refreshTotalWorkingHours === true) {
       await Employee.recomputeTotalWorkingHours(employee._id);
     }
@@ -1122,16 +1290,12 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
 
 // ═════════════════════════════════════════════════════════════════════════
 // ADJUST LEAVE USED
-//   POST /api/employees/:employeeId/leave-used
-//   body: { type, year, month, delta }
-//   delta = +1 to consume one day, -1 to give one back (revert)
 // ═════════════════════════════════════════════════════════════════════════
 export async function adjustLeaveUsed(req: AuthRequest, res: Response): Promise<void> {
   try {
     const { employeeId } = req.params;
     const { type, year, month, delta } = req.body;
 
-    // Free-form type — just require a non-empty trimmed string
     const leaveType = String(type || '').trim();
     if (!leaveType) {
       res.status(400).json({
@@ -1172,7 +1336,6 @@ export async function adjustLeaveUsed(req: AuthRequest, res: Response): Promise<
 
     const needle = leaveType.toLowerCase();
 
-    // Match on type + year + month (case-insensitive on type)
     const idx = employee.leaveAllocations.findIndex(
       (a) =>
         a.type.trim().toLowerCase() === needle &&
@@ -1219,8 +1382,6 @@ export async function adjustLeaveUsed(req: AuthRequest, res: Response): Promise<
 
 // ═════════════════════════════════════════════════════════════════════════
 // EXTEND ALL OPEN-ENDED SCHEDULES (cron entry)
-//   POST /api/employees/extend-schedules
-//   body: { year?: number }
 // ═════════════════════════════════════════════════════════════════════════
 export async function extendAllSchedules(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -1233,7 +1394,6 @@ export async function extendAllSchedules(req: AuthRequest, res: Response): Promi
       return;
     }
 
-    // Only employees with at least one open-ended schedule
     const employees = await Employee.find({
       isDeleted: false,
       leaveSchedules: { $elemMatch: { endYear: { $exists: false } } },
@@ -1377,6 +1537,8 @@ export async function getEmployeeStats(_req: AuthRequest, res: Response): Promis
       withUser,
       withoutUser,
       onDefaultShift,
+      fixedCount,
+      pieceRateCount,
       byDepartment,
       byStatusRaw,
       totalLeaveAllocatedAgg,
@@ -1395,6 +1557,8 @@ export async function getEmployeeStats(_req: AuthRequest, res: Response): Promis
         standardCheckIn: '09:00',
         standardCheckOut: '18:00',
       }),
+      Employee.countDocuments({ ...baseFilter, salaryStructure: 'fixed' }),
+      Employee.countDocuments({ ...baseFilter, salaryStructure: 'piece_rate' }),
       Employee.aggregate([
         { $match: baseFilter },
         { $group: { _id: '$department', count: { $sum: 1 } } },
@@ -1404,7 +1568,6 @@ export async function getEmployeeStats(_req: AuthRequest, res: Response): Promis
         { $match: baseFilter },
         { $group: { _id: '$employmentStatus', count: { $sum: 1 } } },
       ]),
-      // Aggregate total credited leave across all employees for the current year
       Employee.aggregate([
         { $match: baseFilter },
         { $unwind: '$leaveAllocations' },
@@ -1423,7 +1586,6 @@ export async function getEmployeeStats(_req: AuthRequest, res: Response): Promis
           },
         },
       ]),
-      // Aggregate total used leave across all employees for the current year
       Employee.aggregate([
         { $match: baseFilter },
         { $unwind: '$leaveAllocations' },
@@ -1475,6 +1637,8 @@ export async function getEmployeeStats(_req: AuthRequest, res: Response): Promis
           withUser,
           withoutUser,
           onDefaultShift,
+          fixedCount,
+          pieceRateCount,
           totalLeaveAllocated,
           totalLeaveUsed,
           totalLeaveRemaining: Math.max(
