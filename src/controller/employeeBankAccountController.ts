@@ -679,3 +679,99 @@ export async function deleteBankAccountFlat(
 ): Promise<void> {
   return deleteEmployeeBankAccount(req, res);
 }
+// ═════════════════════════════════════════════════════════════════
+// SELF-SERVICE CONTROLLERS — scope to req.user._id
+// ═════════════════════════════════════════════════════════════════
+
+export async function createSelfBankAccount(
+  req: AuthRequest,
+  res: Response
+): Promise<void> {
+  try {
+    const emp = await Employee.findOne({
+      user: req.user!._id,
+      isDeleted: false,
+    });
+    if (!emp) {
+      bad(res, 'Employee record not found', 404);
+      return;
+    }
+
+    // Delegate to the existing nested handler by injecting the employeeId param
+    (req.params as any).employeeId = String(emp._id);
+    return createEmployeeBankAccount(req, res);
+  } catch (err: any) {
+    console.error('createSelfBankAccount error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+}
+
+export async function updateSelfBankAccount(
+  req: AuthRequest,
+  res: Response
+): Promise<void> {
+  try {
+    const emp = await Employee.findOne({
+      user: req.user!._id,
+      isDeleted: false,
+    }).select('_id');
+    if (!emp) {
+      bad(res, 'Employee record not found', 404);
+      return;
+    }
+
+    const account = await EmployeeBankAccount.findOne({
+      _id: req.params.accountId,
+      employee: emp._id,
+      isDeleted: false,
+    });
+    if (!account) {
+      bad(res, 'Bank account not found', 404);
+      return;
+    }
+
+    // If the account number changes, reset to pending verification
+    const submittedNumber = req.body.accountNumber
+      ? String(req.body.accountNumber).trim()
+      : undefined;
+    if (submittedNumber && submittedNumber !== account.accountNumber) {
+      (req.body as any).status = 'pending';
+    }
+
+    return updateEmployeeBankAccount(req, res);
+  } catch (err: any) {
+    console.error('updateSelfBankAccount error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+}
+
+export async function deleteSelfBankAccount(
+  req: AuthRequest,
+  res: Response
+): Promise<void> {
+  try {
+    const emp = await Employee.findOne({
+      user: req.user!._id,
+      isDeleted: false,
+    }).select('_id');
+    if (!emp) {
+      bad(res, 'Employee record not found', 404);
+      return;
+    }
+
+    const account = await EmployeeBankAccount.findOne({
+      _id: req.params.accountId,
+      employee: emp._id,
+      isDeleted: false,
+    });
+    if (!account) {
+      bad(res, 'Bank account not found', 404);
+      return;
+    }
+
+    return deleteEmployeeBankAccount(req, res);
+  } catch (err: any) {
+    console.error('deleteSelfBankAccount error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+}

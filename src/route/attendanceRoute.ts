@@ -8,19 +8,24 @@ const router = Router();
 
 router.use(authenticate);
 
-// ── Self-service ─────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+// SELF-SERVICE — any authenticated user, NO authorize() check.
+// The controller resolves the Employee from req.user._id, so the
+// user can only ever see/mark their own records.
+//
+// Order matters: '/me/monthly' and '/me' MUST come before '/:id'.
+// ─────────────────────────────────────────────────────────────────
 router.get('/me', attendanceController.getMyAttendance);
+router.get('/me/monthly', attendanceController.getMyMonthly);
 router.get('/today', attendanceController.getMyToday);
 
-/**
- * Auto attendance from login/logout.
- * No `authorize()` needed — every authenticated user marks their own
- * attendance. The controller resolves the Employee from req.user._id.
- */
 router.post('/check-in', attendanceController.checkIn);
 router.post('/check-out', attendanceController.checkOut);
 
-// ── Admin ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+// ADMIN ONLY — everything below requires attendance permissions.
+// ─────────────────────────────────────────────────────────────────
+
 router.get(
   '/stats',
   authorize('attendance', 'view'),
@@ -57,8 +62,8 @@ router.post(
   attendanceController.reconcileDay
 );
 
-// ── Dedicated employee monthly view ──────────────────────────────
-// IMPORTANT: this MUST come before '/:id'
+// ── Dedicated employee monthly view (admin) ──────────────────────
+// MUST come before '/:id'
 router.get(
   '/employee/:employeeId/monthly',
   authorize('attendance', 'view'),

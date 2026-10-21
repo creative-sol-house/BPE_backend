@@ -268,6 +268,41 @@ function validateAttachments(input: any): {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+// OWNERSHIP CHECK HELPER
+// Any authenticated user with one of these relationships to the task can
+// view / act on it. Falls back to the corresponding module permission for
+// admins/managers.
+// ═════════════════════════════════════════════════════════════════════════
+type TaskPermissionAction = 'view' | 'add' | 'edit' | 'delete';
+
+async function userCanAccessTask(
+  req: AuthRequest,
+  task: any,
+  opts: { permission?: TaskPermissionAction; requireAssigneeOnly?: boolean } = {}
+): Promise<boolean> {
+  if (!req.user) return false;
+  if (req.user.isMainAdmin) return true;
+
+  const userId = String(req.user._id);
+  const isAssignee = task.assignedTo && String(task.assignedTo) === userId;
+  const isAssigner = task.assignedBy && String(task.assignedBy) === userId;
+  const isCreator = task.createdBy && String(task.createdBy) === userId;
+
+  // For actions like logging time — only the assignee (or an admin) should act
+  if (opts.requireAssigneeOnly) {
+    if (isAssignee) return true;
+    if (opts.permission && (await req.user.can('tasks', opts.permission))) return true;
+    return false;
+  }
+
+  if (isAssignee || isAssigner || isCreator) return true;
+
+  if (opts.permission && (await req.user.can('tasks', opts.permission))) return true;
+
+  return false;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
 // CREATE TASK
 //   POST /api/tasks
 //
@@ -388,7 +423,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
     }
 
     // ── 9. Parent task (optional) ───────────────────────────────────────
-    // Parent tasks must be in the same project (or both internal).
     let resolvedParentId: mongoose.Types.ObjectId | null = null;
     if (parentTaskId) {
       if (!mongoose.Types.ObjectId.isValid(String(parentTaskId))) {
@@ -421,7 +455,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
     }
 
     // ── 10. Depends-on (optional) ───────────────────────────────────────
-    // Dependencies must be in the same project (or both internal).
     let resolvedDependsOn: mongoose.Types.ObjectId[] = [];
     if (dependsOn !== undefined && dependsOn !== null) {
       if (!Array.isArray(dependsOn)) {
@@ -454,7 +487,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
         });
         return;
       }
-      // Same-project (or both-internal) check
       const depFilter: any = {
         _id: { $in: ids },
         isDeleted: false,
@@ -550,7 +582,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
 
     await task.save();
 
-    // Populate for the response
     const fresh = await Task.findById(task._id)
       .populate('projectId', 'projectId name status projectType')
       .populate('assignedTo', 'name employeeId designation department')
@@ -599,12 +630,8 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// LIST TASKS
+// LIST TASKS (admin)
 //   GET /api/tasks
-//
-//   New filter: `hasProject` — 'true' | 'false'
-//     - true  → only tasks that belong to a project
-//     - false → only internal tasks (projectId: null)
 // ═════════════════════════════════════════════════════════════════════════
 export async function listTasks(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -631,7 +658,6 @@ export async function listTasks(req: AuthRequest, res: Response): Promise<void> 
       isDeleted: onlyDeleted === 'true',
     };
 
-    // ── Project ─────────────────────────────────────────────────────────
     if (projectId) {
       if (!mongoose.Types.ObjectId.isValid(String(projectId))) {
         res.status(400).json({ success: false, message: 'Invalid projectId' });
@@ -640,7 +666,6 @@ export async function listTasks(req: AuthRequest, res: Response): Promise<void> 
       filter.projectId = projectId;
     }
 
-    // ── hasProject: filter by whether the task has a project or not ─────
     if (hasProject !== undefined) {
       if (hasProject === 'true') {
         filter.projectId = { $ne: null };
@@ -655,7 +680,6 @@ export async function listTasks(req: AuthRequest, res: Response): Promise<void> 
       }
     }
 
-    // ── Category ────────────────────────────────────────────────────────
     if (categoryId) {
       if (!mongoose.Types.ObjectId.isValid(String(categoryId))) {
         res.status(400).json({ success: false, message: 'Invalid categoryId' });
@@ -664,7 +688,6 @@ export async function listTasks(req: AuthRequest, res: Response): Promise<void> 
       filter.categoryId = categoryId;
     }
 
-    // ── Assigned to ─────────────────────────────────────────────────────
     if (assignedTo) {
       if (!mongoose.Types.ObjectId.isValid(String(assignedTo))) {
         res.status(400).json({ success: false, message: 'Invalid assignedTo id' });
@@ -673,7 +696,6 @@ export async function listTasks(req: AuthRequest, res: Response): Promise<void> 
       filter.assignedTo = assignedTo;
     }
 
-    // ── Status (single or comma-separated) ──────────────────────────────
     if (status) {
       const list = String(status)
         .split(',')
@@ -683,10 +705,8 @@ export async function listTasks(req: AuthRequest, res: Response): Promise<void> 
       else if (list.length > 1) filter.status = { $in: list };
     }
 
-    // ── Priority ────────────────────────────────────────────────────────
     if (priority) filter.priority = priority;
 
-    // ── Parent task ─────────────────────────────────────────────────────
     if (parentTaskId) {
       if (!mongoose.Types.ObjectId.isValid(String(parentTaskId))) {
         res.status(400).json({ success: false, message: 'Invalid parentTaskId' });
@@ -695,7 +715,6 @@ export async function listTasks(req: AuthRequest, res: Response): Promise<void> 
       filter.parentTaskId = parentTaskId;
     }
 
-    // ── Overdue ─────────────────────────────────────────────────────────
     if (overdue === 'true') {
       filter.status = filter.status || { $in: OPEN_TASK_STATUSES };
       filter.dueDate = { ...(filter.dueDate || {}), $lt: new Date() };
@@ -714,7 +733,6 @@ export async function listTasks(req: AuthRequest, res: Response): Promise<void> 
       }
     }
 
-    // ── Tags ────────────────────────────────────────────────────────────
     if (tags) {
       const tagList = String(tags)
         .split(',')
@@ -723,7 +741,6 @@ export async function listTasks(req: AuthRequest, res: Response): Promise<void> 
       if (tagList.length) filter.tags = { $in: tagList };
     }
 
-    // ── Search ──────────────────────────────────────────────────────────
     if (search) {
       filter.$or = [
         { title: { $regex: search, $options: 'i' } },
@@ -769,9 +786,6 @@ export async function listTasks(req: AuthRequest, res: Response): Promise<void> 
 // ═════════════════════════════════════════════════════════════════════════
 // LIST MY TASKS
 //   GET /api/tasks/my
-//
-//   New filter: `includeInternal` — when false, excludes internal tasks.
-//   By default, internal tasks ARE included.
 // ═════════════════════════════════════════════════════════════════════════
 export async function listMyTasks(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -820,7 +834,6 @@ export async function listMyTasks(req: AuthRequest, res: Response): Promise<void
       filter.projectId = projectId;
     }
 
-    // ── hasProject: filter project vs internal tasks ────────────────────
     if (hasProject !== undefined) {
       if (hasProject === 'true') {
         filter.projectId = { $ne: null };
@@ -878,7 +891,6 @@ export async function listMyTasks(req: AuthRequest, res: Response): Promise<void
 
 // ═════════════════════════════════════════════════════════════════════════
 // GET TASK BY ID
-//   GET /api/tasks/:taskId
 // ═════════════════════════════════════════════════════════════════════════
 export async function getTask(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -903,6 +915,13 @@ export async function getTask(req: AuthRequest, res: Response): Promise<void> {
       return;
     }
 
+    // ── Ownership check ────────────────────────────────────────────────
+    const allowed = await userCanAccessTask(req, task, { permission: 'view' });
+    if (!allowed) {
+      res.status(403).json({ success: false, message: 'You cannot view this task' });
+      return;
+    }
+
     res.json({ success: true, data: task });
   } catch (err: any) {
     console.error('getTask error:', err);
@@ -912,11 +931,6 @@ export async function getTask(req: AuthRequest, res: Response): Promise<void> {
 
 // ═════════════════════════════════════════════════════════════════════════
 // UPDATE TASK
-//   PATCH /api/tasks/:taskId
-//
-//   `projectId` is intentionally NOT updatable here — a task stays with
-//   its project (or stays internal). To move a task to a project, use the
-//   dedicated "convert" flow (out of scope for now).
 // ═════════════════════════════════════════════════════════════════════════
 export async function updateTask(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -959,7 +973,6 @@ export async function updateTask(req: AuthRequest, res: Response): Promise<void>
       tags,
     } = req.body;
 
-    // ── Validation ──────────────────────────────────────────────────────
     if (title !== undefined) {
       const t = String(title).trim();
       if (!t) {
@@ -1016,7 +1029,6 @@ export async function updateTask(req: AuthRequest, res: Response): Promise<void>
       }
     }
 
-    // ── Category resolution (guarded against internal tasks) ────────────
     let resolvedCategoryId: mongoose.Types.ObjectId | null | undefined;
     if (categoryId !== undefined) {
       const r = await resolveCategoryForProject(task.projectId, categoryId);
@@ -1027,7 +1039,6 @@ export async function updateTask(req: AuthRequest, res: Response): Promise<void>
       resolvedCategoryId = r.categoryId;
     }
 
-    // ── Assigned to resolution ──────────────────────────────────────────
     let resolvedAssignee: mongoose.Types.ObjectId | null | undefined;
     if (assignedTo !== undefined) {
       const r = await resolveEmployee(assignedTo);
@@ -1038,7 +1049,6 @@ export async function updateTask(req: AuthRequest, res: Response): Promise<void>
       resolvedAssignee = r.id;
     }
 
-    // ── Parent task resolution ──────────────────────────────────────────
     let resolvedParentId: mongoose.Types.ObjectId | null | undefined;
     if (parentTaskId !== undefined) {
       if (parentTaskId === null || parentTaskId === '') {
@@ -1085,7 +1095,6 @@ export async function updateTask(req: AuthRequest, res: Response): Promise<void>
       }
     }
 
-    // ── Depends-on ──────────────────────────────────────────────────────
     let resolvedDependsOn: mongoose.Types.ObjectId[] | undefined;
     if (dependsOn !== undefined && dependsOn !== null) {
       if (!Array.isArray(dependsOn)) {
@@ -1145,7 +1154,6 @@ export async function updateTask(req: AuthRequest, res: Response): Promise<void>
       resolvedDependsOn = deps.map((d) => d._id);
     }
 
-    // ── Tags ────────────────────────────────────────────────────────────
     let resolvedTags: string[] | undefined;
     if (tags !== undefined) {
       const r = validateTags(tags);
@@ -1156,7 +1164,6 @@ export async function updateTask(req: AuthRequest, res: Response): Promise<void>
       resolvedTags = r.parsed;
     }
 
-    // ── Apply changes ───────────────────────────────────────────────────
     const performer = req.user?._id ?? null;
 
     if (title !== undefined) task.title = String(title).trim();
@@ -1324,7 +1331,6 @@ export async function updateTask(req: AuthRequest, res: Response): Promise<void>
 
 // ═════════════════════════════════════════════════════════════════════════
 // ASSIGN / REASSIGN
-//   PATCH /api/tasks/:taskId/assign
 // ═════════════════════════════════════════════════════════════════════════
 export async function assignTask(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -1387,7 +1393,6 @@ export async function assignTask(req: AuthRequest, res: Response): Promise<void>
 
 // ═════════════════════════════════════════════════════════════════════════
 // CHANGE STATUS
-//   PATCH /api/tasks/:taskId/status
 // ═════════════════════════════════════════════════════════════════════════
 export async function changeTaskStatus(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -1408,6 +1413,16 @@ export async function changeTaskStatus(req: AuthRequest, res: Response): Promise
       return;
     }
 
+    // ── Ownership check ────────────────────────────────────────────────
+    const allowed = await userCanAccessTask(req, task, { permission: 'edit' });
+    if (!allowed) {
+      res.status(403).json({
+        success: false,
+        message: "You cannot change this task's status",
+      });
+      return;
+    }
+
     await task.setStatus(status as TaskStatus, req.user?._id ?? null, notes);
 
     res.json({
@@ -1423,7 +1438,6 @@ export async function changeTaskStatus(req: AuthRequest, res: Response): Promise
 
 // ═════════════════════════════════════════════════════════════════════════
 // LOG TIME
-//   POST /api/tasks/:taskId/time
 // ═════════════════════════════════════════════════════════════════════════
 export async function logTaskTime(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -1446,6 +1460,19 @@ export async function logTaskTime(req: AuthRequest, res: Response): Promise<void
     const task = await Task.findOne(buildLookupQuery(String(taskId)));
     if (!task) {
       res.status(404).json({ success: false, message: 'Task not found' });
+      return;
+    }
+
+    // ── Ownership check (assignee only, or tasks:edit) ────────────────
+    const allowed = await userCanAccessTask(req, task, {
+      permission: 'edit',
+      requireAssigneeOnly: true,
+    });
+    if (!allowed) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot log time on this task',
+      });
       return;
     }
 
@@ -1472,7 +1499,6 @@ export async function logTaskTime(req: AuthRequest, res: Response): Promise<void
 
 // ═════════════════════════════════════════════════════════════════════════
 // CHANGE ESTIMATE
-//   PATCH /api/tasks/:taskId/estimate
 // ═════════════════════════════════════════════════════════════════════════
 export async function changeTaskEstimate(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -1533,6 +1559,16 @@ export async function addTaskActivity(req: AuthRequest, res: Response): Promise<
     const task = await Task.findOne(buildLookupQuery(String(taskId)));
     if (!task) {
       res.status(404).json({ success: false, message: 'Task not found' });
+      return;
+    }
+
+    // ── Ownership check ────────────────────────────────────────────────
+    const allowed = await userCanAccessTask(req, task, { permission: 'edit' });
+    if (!allowed) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot add activities to this task',
+      });
       return;
     }
 
@@ -1604,6 +1640,16 @@ export async function addTaskComment(req: AuthRequest, res: Response): Promise<v
     const task = await Task.findOne(buildLookupQuery(String(taskId)));
     if (!task) {
       res.status(404).json({ success: false, message: 'Task not found' });
+      return;
+    }
+
+    // ── Ownership check ────────────────────────────────────────────────
+    const allowed = await userCanAccessTask(req, task, { permission: 'edit' });
+    if (!allowed) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot comment on this task',
+      });
       return;
     }
 
@@ -1680,6 +1726,16 @@ export async function addTaskAttachment(req: AuthRequest, res: Response): Promis
     const task = await Task.findOne(buildLookupQuery(String(taskId)));
     if (!task) {
       res.status(404).json({ success: false, message: 'Task not found' });
+      return;
+    }
+
+    // ── Ownership check ────────────────────────────────────────────────
+    const allowed = await userCanAccessTask(req, task, { permission: 'edit' });
+    if (!allowed) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot attach files to this task',
+      });
       return;
     }
 
@@ -1817,7 +1873,7 @@ export async function restoreTask(req: AuthRequest, res: Response): Promise<void
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// HARD DELETE (permanent, main admin only, must be soft-deleted first)
+// HARD DELETE
 // ═════════════════════════════════════════════════════════════════════════
 export async function hardDeleteTask(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -1867,14 +1923,6 @@ export async function hardDeleteTask(req: AuthRequest, res: Response): Promise<v
 
 // ═════════════════════════════════════════════════════════════════════════
 // TASK STATS
-//   GET /api/tasks/stats
-//
-//   Query params:
-//     projectId   — restrict to a specific project
-//     assignedTo  — restrict to a specific employee
-//     hasProject  — 'true' | 'false' (project vs internal)
-//
-//   Response now includes `internalCount` and `projectCount`.
 // ═════════════════════════════════════════════════════════════════════════
 export async function getTaskStats(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -1898,10 +1946,6 @@ export async function getTaskStats(req: AuthRequest, res: Response): Promise<voi
       baseFilter.assignedTo = assignedTo;
     }
 
-    // ── Split base filter for internal vs project counts ────────────────
-    // These counts are computed against the SAME base filter (minus the
-    // hasProject restriction), so they give a meaningful breakdown even
-    // when hasProject is used to narrow the main numbers.
     const internalScopeFilter: any = { ...baseFilter, projectId: null };
     const outerScopeFilter: any = { ...baseFilter, projectId: { $ne: null } };
 
@@ -1959,9 +2003,7 @@ export async function getTaskStats(req: AuthRequest, res: Response): Promise<voi
 
       Task.countDocuments({ ...baseFilter, assignedTo: null }),
 
-      // Internal count — respects projectId/assignedTo scope, always internal
       Task.countDocuments(internalScopeFilter),
-      // Project count — respects projectId/assignedTo scope, always project
       Task.countDocuments(outerScopeFilter),
 
       Task.aggregate([
@@ -2039,10 +2081,6 @@ export async function getTaskStats(req: AuthRequest, res: Response): Promise<voi
 
 // ═════════════════════════════════════════════════════════════════════════
 // RECOMPUTE PARENT PROJECT PROGRESS
-//   POST /api/tasks/:taskId/recompute-progress
-//
-//   Internal tasks (projectId === null) return a clear 400 instead of
-//   a silent no-op.
 // ═════════════════════════════════════════════════════════════════════════
 export async function recomputeFromTask(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -2088,9 +2126,6 @@ export async function recomputeFromTask(req: AuthRequest, res: Response): Promis
 
 // ═════════════════════════════════════════════════════════════════════════
 // BULK: LIST BY PROJECT
-//   GET /api/projects/:projectId/tasks
-//
-//   Thin wrapper that guarantees the project filter is applied.
 // ═════════════════════════════════════════════════════════════════════════
 export async function listTasksByProject(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -2164,12 +2199,7 @@ export async function listTasksByProject(req: AuthRequest, res: Response): Promi
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// LIST INTERNAL TASKS (convenience endpoint)
-//   GET /api/tasks/internal
-//
-//   Thin wrapper that guarantees `projectId: null` is applied.
-//   Supports the same filters as `listTasks`: status, priority, assignee,
-//   overdue, search, tags, pagination, sort.
+// LIST INTERNAL TASKS
 // ═════════════════════════════════════════════════════════════════════════
 export async function listInternalTasks(
   req: AuthRequest,
@@ -2196,7 +2226,6 @@ export async function listInternalTasks(
       projectId: null,
     };
 
-    // ── Assigned to ─────────────────────────────────────────────────────
     if (assignedTo) {
       if (!mongoose.Types.ObjectId.isValid(String(assignedTo))) {
         res.status(400).json({ success: false, message: 'Invalid assignedTo id' });
@@ -2205,7 +2234,6 @@ export async function listInternalTasks(
       filter.assignedTo = assignedTo;
     }
 
-    // ── Status (single or comma-separated) ──────────────────────────────
     if (status) {
       const list = String(status)
         .split(',')
@@ -2215,10 +2243,8 @@ export async function listInternalTasks(
       else if (list.length > 1) filter.status = { $in: list };
     }
 
-    // ── Priority ────────────────────────────────────────────────────────
     if (priority) filter.priority = priority;
 
-    // ── Overdue / due-date range ────────────────────────────────────────
     if (overdue === 'true') {
       filter.status = filter.status || { $in: OPEN_TASK_STATUSES };
       filter.dueDate = { ...(filter.dueDate || {}), $lt: new Date() };
@@ -2237,7 +2263,6 @@ export async function listInternalTasks(
       }
     }
 
-    // ── Tags ────────────────────────────────────────────────────────────
     if (tags) {
       const tagList = String(tags)
         .split(',')
@@ -2246,7 +2271,6 @@ export async function listInternalTasks(
       if (tagList.length) filter.tags = { $in: tagList };
     }
 
-    // ── Search ──────────────────────────────────────────────────────────
     if (search) {
       filter.$or = [
         { title: { $regex: search, $options: 'i' } },

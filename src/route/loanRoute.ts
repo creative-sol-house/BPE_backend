@@ -11,11 +11,13 @@ router.use(authenticate);
 router.get('/stats', ctrl.loanStats);
 router.get('/employee/:employeeId/summary', ctrl.getEmployeeLoanSummary);
 
-// List & get
-router.get('/', authorize('loans', 'view'), ctrl.listLoans);
-router.get('/:loanId', authorize('loans', 'view'), ctrl.getLoan);
+// List — controller checks scope: mine = self, all = needs loans:view
+router.get('/', ctrl.listLoans);
 
-// Cancel / installment operations
+// Get one — controller checks isOwner OR loans:view
+router.get('/:loanId', ctrl.getLoan);
+
+// Cancel / installment operations (still admin-only)
 router.post('/:loanId/cancel', authorize('loans', 'edit'), ctrl.cancelLoan);
 router.post(
   '/:loanId/installments/:seq/pay',

@@ -59,6 +59,30 @@ function validateMilestones(
   return { ok: true, parsed };
 }
 
+/**
+ * Returns true if the caller can act on this project.
+ *   • main admin → always true
+ *   • has `projects:edit` → true
+ *   • is the project's manager → true
+ *   • otherwise → false
+ */
+async function canActOnProject(
+  req: AuthRequest,
+  project: any
+): Promise<boolean> {
+  if (!req.user) return false;
+  if (req.user.isMainAdmin) return true;
+
+  const hasEdit = await req.user.can('projects', 'edit');
+  if (hasEdit) return true;
+
+  const isPM =
+    String(project.projectManager?._id ?? project.projectManager) ===
+    String(req.user._id);
+  return isPM;
+}
+
+
 /** Validate and normalize task categories. */
 function validateTaskCategories(
   input: any
@@ -1314,6 +1338,15 @@ export async function toggleProjectMilestone(req: AuthRequest, res: Response): P
       return;
     }
 
+    // ── Permission check: admin OR projects:edit OR PM of this project ──
+    if (!(await canActOnProject(req, project))) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot manage this project\'s milestones',
+      });
+      return;
+    }
+
     const milestone: any = project.milestones.find(
       (m: any) => String(m._id) === String(milestoneId)
     );
@@ -1326,7 +1359,10 @@ export async function toggleProjectMilestone(req: AuthRequest, res: Response): P
     milestone.completedAt = milestone.isCompleted ? new Date() : undefined;
     project.markModified('milestones');
 
-    project.progress = computeProgressFromMilestones(project.milestones, project.progress);
+    project.progress = computeProgressFromMilestones(
+      project.milestones,
+      project.progress
+    );
 
     if (milestone.isCompleted) {
       project.activities.push({
@@ -1546,9 +1582,6 @@ export async function removeTaskCategory(req: AuthRequest, res: Response): Promi
   }
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// TEAM MANAGEMENT
-// ═════════════════════════════════════════════════════════════════════════
 export async function setProjectTeam(req: AuthRequest, res: Response): Promise<void> {
   try {
     const { projectId } = req.params;
@@ -1557,6 +1590,15 @@ export async function setProjectTeam(req: AuthRequest, res: Response): Promise<v
     const project = await Project.findOne(buildLookupQuery(String(projectId)));
     if (!project) {
       res.status(404).json({ success: false, message: 'Project not found' });
+      return;
+    }
+
+    // ── Permission check: admin OR projects:edit OR PM of this project ──
+    if (!(await canActOnProject(req, project))) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot change this project\'s team',
+      });
       return;
     }
 
@@ -1584,10 +1626,6 @@ export async function setProjectTeam(req: AuthRequest, res: Response): Promise<v
   }
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// STATUS TRANSITION
-//   PATCH /api/projects/:projectId/status
-// ═════════════════════════════════════════════════════════════════════════
 export async function changeProjectStatus(req: AuthRequest, res: Response): Promise<void> {
   try {
     const { projectId } = req.params;
@@ -1607,7 +1645,19 @@ export async function changeProjectStatus(req: AuthRequest, res: Response): Prom
       return;
     }
 
-    await project.applyChanges({ status: status as ProjectStatus }, req.user?._id ?? null);
+    // ── Permission check: admin OR projects:edit OR PM of this project ──
+    if (!(await canActOnProject(req, project))) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot change this project\'s status',
+      });
+      return;
+    }
+
+    await project.applyChanges(
+      { status: status as ProjectStatus },
+      req.user?._id ?? null
+    );
 
     if (notes && String(notes).trim()) {
       await project.logActivity('note', String(notes).trim().slice(0, 2000), {
@@ -1626,16 +1676,21 @@ export async function changeProjectStatus(req: AuthRequest, res: Response): Prom
   }
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// RECOMPUTE PROGRESS FROM TASKS
-//   POST /api/projects/:projectId/recompute-progress
-// ═════════════════════════════════════════════════════════════════════════
 export async function recomputeProjectProgress(req: AuthRequest, res: Response): Promise<void> {
   try {
     const { projectId } = req.params;
     const project = await Project.findOne(buildLookupQuery(String(projectId)));
     if (!project) {
       res.status(404).json({ success: false, message: 'Project not found' });
+      return;
+    }
+
+    // ── Permission check: admin OR projects:edit OR PM of this project ──
+    if (!(await canActOnProject(req, project))) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot recompute this project\'s progress',
+      });
       return;
     }
 
@@ -1665,7 +1720,6 @@ export async function recomputeProjectProgress(req: AuthRequest, res: Response):
     res.status(500).json({ success: false, message: err.message });
   }
 }
-
 // ═════════════════════════════════════════════════════════════════════════
 // DELETE (soft) / RESTORE
 // ═════════════════════════════════════════════════════════════════════════

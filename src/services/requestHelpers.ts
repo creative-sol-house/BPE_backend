@@ -115,7 +115,7 @@ export function groupWorkingDatesByMonth(
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// TIME HELPERS  (NEW — used by overtime + permission)
+// TIME HELPERS  (used by overtime + permission)
 // ══════════════════════════════════════════════════════════════════════════
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
@@ -183,13 +183,27 @@ export interface LeaveBalanceRow {
   remaining: number;
 }
 
+export interface LeaveBalanceSummary {
+  year: number;
+  totalAllocated: number;
+  totalUsed: number;
+  totalRemaining: number;
+}
+
+export interface LeaveBalance {
+  rows: LeaveBalanceRow[];
+  totals: { allocated: number; used: number; pending: number; remaining: number };
+  types: string[];
+  summary: LeaveBalanceSummary | null;
+  year: number;
+}
+
 export async function getLeaveBalance(
   employeeId: Types.ObjectId,
   opts: { year?: number; type?: string } = {}
-): Promise<{
-  rows: LeaveBalanceRow[];
-  totals: { allocated: number; used: number; pending: number; remaining: number };
-}> {
+): Promise<LeaveBalance> {
+  const targetYear = opts.year ?? new Date().getUTCFullYear();
+
   const employee = await Employee.findOne({
     _id: employeeId,
     isDeleted: false,
@@ -198,6 +212,9 @@ export async function getLeaveBalance(
     return {
       rows: [],
       totals: { allocated: 0, used: 0, pending: 0, remaining: 0 },
+      types: [],
+      summary: null,
+      year: targetYear,
     };
   }
 
@@ -245,14 +262,31 @@ export async function getLeaveBalance(
     { allocated: 0, used: 0, pending: 0, remaining: 0 }
   );
 
+  const totalsRounded = {
+    allocated: +totals.allocated.toFixed(2),
+    used: +totals.used.toFixed(2),
+    pending: +totals.pending.toFixed(2),
+    remaining: +totals.remaining.toFixed(2),
+  };
+
+  // Derive the extra fields the new callers expect
+  const types = [...new Set(rows.map((r) => r.type))].sort();
+  const summary: LeaveBalanceSummary | null =
+    rows.length > 0
+      ? {
+          year: targetYear,
+          totalAllocated: totalsRounded.allocated,
+          totalUsed: totalsRounded.used,
+          totalRemaining: totalsRounded.remaining,
+        }
+      : null;
+
   return {
     rows,
-    totals: {
-      allocated: +totals.allocated.toFixed(2),
-      used: +totals.used.toFixed(2),
-      pending: +totals.pending.toFixed(2),
-      remaining: +totals.remaining.toFixed(2),
-    },
+    totals: totalsRounded,
+    types,
+    summary,
+    year: targetYear,
   };
 }
 
@@ -532,14 +566,7 @@ export async function computeBalancePreview(
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// OVERTIME — for payroll consumption  (NEW)
-//
-// Returns the total approved overtime hours, amount, and a per-request
-// breakdown for the given employee between `from` and `to` (inclusive).
-//
-// Payroll should call this with the pay-period window. Only APPROVED
-// requests count. Uses the approver's adjusted values when present,
-// otherwise the submitted snapshot.
+// OVERTIME — for payroll consumption
 // ══════════════════════════════════════════════════════════════════════════
 
 export interface OvertimePayrollEntry {

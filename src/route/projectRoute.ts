@@ -1,6 +1,7 @@
 // routes/projectRoutes.ts
 import { Router } from 'express';
 import * as projectController from '../controller/projectController';
+import * as taskController from '../controller/taskController';
 import { authenticate } from '../middleware/auth';
 import { authorize } from '../middleware/authorize';
 
@@ -25,7 +26,7 @@ projectRouter.get(
 );
 
 // ═════════════════════════════════════════════════════════════════════════
-// GENERIC LIST / CREATE
+// GENERIC LIST / CREATE  (admin)
 // ═════════════════════════════════════════════════════════════════════════
 
 projectRouter.get(
@@ -40,8 +41,6 @@ projectRouter.post(
   projectController.createProject
 );
 
-import * as taskController from '../controller/taskController';
-
 projectRouter.get(
   '/:projectId/tasks',
   authorize('tasks', 'view'),
@@ -49,7 +48,7 @@ projectRouter.get(
 );
 
 // ═════════════════════════════════════════════════════════════════════════
-// GET / UPDATE ONE (accepts _id or "PRJ-XXXXX")
+// GET ONE  (admin — self-service is /api/me/projects/:id)
 // ═════════════════════════════════════════════════════════════════════════
 
 projectRouter.get(
@@ -58,30 +57,35 @@ projectRouter.get(
   projectController.getProject
 );
 
-projectRouter.patch(
-  '/:projectId',
-  authorize('projects', 'edit'),
-  projectController.updateProject
-);
+// ═════════════════════════════════════════════════════════════════════════
+// UPDATE / STATUS / TEAM / MILESTONE TOGGLE / RECOMPUTE
+//
+// These are PM-OR-ADMIN actions. The route NO LONGER uses authorize() —
+// the controller enforces "admin OR projects:edit OR is-PM-of-this-project"
+// via the canActOnProject() helper.
+// ═════════════════════════════════════════════════════════════════════════
 
-// ═════════════════════════════════════════════════════════════════════════
-// STATUS / TEAM
-// ═════════════════════════════════════════════════════════════════════════
+projectRouter.patch('/:projectId', projectController.updateProject);
 
 projectRouter.patch(
   '/:projectId/status',
-  authorize('projects', 'edit'),
   projectController.changeProjectStatus
 );
 
-projectRouter.put(
-  '/:projectId/team',
-  authorize('projects', 'edit'),
-  projectController.setProjectTeam
+projectRouter.put('/:projectId/team', projectController.setProjectTeam);
+
+projectRouter.patch(
+  '/:projectId/milestones/:milestoneId',
+  projectController.toggleProjectMilestone
+);
+
+projectRouter.post(
+  '/:projectId/recompute-progress',
+  projectController.recomputeProjectProgress
 );
 
 // ═════════════════════════════════════════════════════════════════════════
-// SUB-RESOURCE: TASK CATEGORIES
+// SUB-RESOURCE: TASK CATEGORIES  (admin-only)
 // ═════════════════════════════════════════════════════════════════════════
 
 projectRouter.post(
@@ -103,7 +107,7 @@ projectRouter.delete(
 );
 
 // ═════════════════════════════════════════════════════════════════════════
-// SUB-RESOURCE: ACTIVITIES
+// SUB-RESOURCE: ACTIVITIES  (admin-only)
 // ═════════════════════════════════════════════════════════════════════════
 
 projectRouter.post(
@@ -119,7 +123,7 @@ projectRouter.delete(
 );
 
 // ═════════════════════════════════════════════════════════════════════════
-// SUB-RESOURCE: ATTACHMENTS
+// SUB-RESOURCE: ATTACHMENTS  (admin-only)
 // ═════════════════════════════════════════════════════════════════════════
 
 projectRouter.post(
@@ -135,19 +139,13 @@ projectRouter.delete(
 );
 
 // ═════════════════════════════════════════════════════════════════════════
-// SUB-RESOURCE: MILESTONES
+// SUB-RESOURCE: MILESTONES  (add / remove = admin-only; toggle is above)
 // ═════════════════════════════════════════════════════════════════════════
 
 projectRouter.post(
   '/:projectId/milestones',
   authorize('projects', 'edit'),
   projectController.addProjectMilestone
-);
-
-projectRouter.patch(
-  '/:projectId/milestones/:milestoneId',
-  authorize('projects', 'edit'),
-  projectController.toggleProjectMilestone
 );
 
 projectRouter.delete(
@@ -157,17 +155,7 @@ projectRouter.delete(
 );
 
 // ═════════════════════════════════════════════════════════════════════════
-// PROGRESS RECOMPUTE (from tasks)
-// ═════════════════════════════════════════════════════════════════════════
-
-projectRouter.post(
-  '/:projectId/recompute-progress',
-  authorize('projects', 'edit'),
-  projectController.recomputeProjectProgress
-);
-
-// ═════════════════════════════════════════════════════════════════════════
-// SOFT DELETE / RESTORE
+// SOFT DELETE / RESTORE  (admin-only)
 // ═════════════════════════════════════════════════════════════════════════
 
 projectRouter.delete(

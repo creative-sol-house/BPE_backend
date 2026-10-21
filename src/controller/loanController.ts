@@ -43,8 +43,8 @@ export async function listLoans(req: AuthRequest, res: Response): Promise<void> 
       filter.status = list.length === 1 ? list[0] : { $in: list };
     }
 
-    const canManage =
-      req.user!.isMainAdmin || (await req.user!.can('loans', 'edit'));
+const canManage =
+  req.user!.isMainAdmin || (await req.user!.can('loans', 'view'));      
 
     if (scope === 'all') {
       if (!canManage) {
@@ -151,7 +151,7 @@ export async function getLoan(req: AuthRequest, res: Response): Promise<void> {
       : null;
     const isOwner = own && String(own._id) === String(loan.employee?._id ?? loan.employee);
     const canManage =
-      req.user!.isMainAdmin || (await req.user!.can('loans', 'edit'));
+      req.user!.isMainAdmin || (await req.user!.can('loans', 'view'));
 
     if (!isOwner && !canManage) {
       bad(res, 'You cannot view this loan', 403);

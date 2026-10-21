@@ -9,24 +9,19 @@ const taskRouter = Router();
 taskRouter.use(authenticate);
 
 // ═════════════════════════════════════════════════════════════════════════
-// SPECIFIC ROUTES FIRST (must come before /:taskId)
+// SELF-SERVICE ROUTES — NO authorize() — controller scopes to req.user._id
 // ═════════════════════════════════════════════════════════════════════════
 
-// ─── My tasks (cross-project personal view; includes internal tasks) ────
-taskRouter.get(
-  '/my',
-  authorize('tasks', 'view'),
-  taskController.listMyTasks
-);
+// My tasks (cross-project personal view; includes internal tasks)
+taskRouter.get('/my', taskController.listMyTasks);
 
-// ─── Internal-only tasks (projectId: null) ──────────────────────────────
-taskRouter.get(
-  '/internal',
-  authorize('tasks', 'view'),
-  taskController.listInternalTasks
-);
+// Internal-only tasks (projectId: null)
+taskRouter.get('/internal', taskController.listInternalTasks);
 
-// ─── Global task stats (supports ?hasProject=true|false) ────────────────
+// ═════════════════════════════════════════════════════════════════════════
+// ADMIN / STATS
+// ═════════════════════════════════════════════════════════════════════════
+
 taskRouter.get(
   '/stats',
   authorize('tasks', 'view'),
@@ -34,7 +29,7 @@ taskRouter.get(
 );
 
 // ═════════════════════════════════════════════════════════════════════════
-// GENERIC LIST / CREATE
+// GENERIC LIST — admin view (employees should call /tasks/my instead)
 // ═════════════════════════════════════════════════════════════════════════
 
 taskRouter.get(
@@ -43,30 +38,21 @@ taskRouter.get(
   taskController.listTasks
 );
 
-taskRouter.post(
-  '/',
-  authorize('tasks', 'add'),
-  taskController.createTask
-);
-
 // ═════════════════════════════════════════════════════════════════════════
-// GET / UPDATE ONE (accepts _id or "TSK-XXXXX")
+// CREATE — any authenticated user can create a task
 // ═════════════════════════════════════════════════════════════════════════
 
-taskRouter.get(
-  '/:taskId',
-  authorize('tasks', 'view'),
-  taskController.getTask
-);
-
-taskRouter.patch(
-  '/:taskId',
-  authorize('tasks', 'edit'),
-  taskController.updateTask
-);
+taskRouter.post('/', taskController.createTask);
 
 // ═════════════════════════════════════════════════════════════════════════
-// ASSIGNMENT / STATUS / TIME / ESTIMATE
+// GET / UPDATE ONE — controller checks isAssignee / isAssigner / isCreator
+// ═════════════════════════════════════════════════════════════════════════
+
+taskRouter.get('/:taskId', taskController.getTask);
+taskRouter.patch('/:taskId', taskController.updateTask);
+
+// ═════════════════════════════════════════════════════════════════════════
+// ASSIGNMENT — restricted to tasks:edit
 // ═════════════════════════════════════════════════════════════════════════
 
 taskRouter.patch(
@@ -75,17 +61,14 @@ taskRouter.patch(
   taskController.assignTask
 );
 
-taskRouter.patch(
-  '/:taskId/status',
-  authorize('tasks', 'edit'),
-  taskController.changeTaskStatus
-);
+// ═════════════════════════════════════════════════════════════════════════
+// STATUS / TIME / ESTIMATE
+// Status + time: assignee can act on their own task (controller checks)
+// Estimate: restricted to tasks:edit
+// ═════════════════════════════════════════════════════════════════════════
 
-taskRouter.post(
-  '/:taskId/time',
-  authorize('tasks', 'edit'),
-  taskController.logTaskTime
-);
+taskRouter.patch('/:taskId/status', taskController.changeTaskStatus);
+taskRouter.post('/:taskId/time', taskController.logTaskTime);
 
 taskRouter.patch(
   '/:taskId/estimate',
@@ -95,13 +78,10 @@ taskRouter.patch(
 
 // ═════════════════════════════════════════════════════════════════════════
 // SUB-RESOURCE: ACTIVITIES
+// POST — anyone assigned can add; DELETE — restricted to tasks:edit
 // ═════════════════════════════════════════════════════════════════════════
 
-taskRouter.post(
-  '/:taskId/activities',
-  authorize('tasks', 'edit'),
-  taskController.addTaskActivity
-);
+taskRouter.post('/:taskId/activities', taskController.addTaskActivity);
 
 taskRouter.delete(
   '/:taskId/activities/:activityId',
@@ -111,13 +91,10 @@ taskRouter.delete(
 
 // ═════════════════════════════════════════════════════════════════════════
 // SUB-RESOURCE: COMMENTS
+// POST — anyone assigned can comment; DELETE — restricted
 // ═════════════════════════════════════════════════════════════════════════
 
-taskRouter.post(
-  '/:taskId/comments',
-  authorize('tasks', 'edit'),
-  taskController.addTaskComment
-);
+taskRouter.post('/:taskId/comments', taskController.addTaskComment);
 
 taskRouter.delete(
   '/:taskId/comments/:commentId',
@@ -127,13 +104,10 @@ taskRouter.delete(
 
 // ═════════════════════════════════════════════════════════════════════════
 // SUB-RESOURCE: ATTACHMENTS
+// POST — anyone assigned can attach; DELETE — restricted
 // ═════════════════════════════════════════════════════════════════════════
 
-taskRouter.post(
-  '/:taskId/attachments',
-  authorize('tasks', 'edit'),
-  taskController.addTaskAttachment
-);
+taskRouter.post('/:taskId/attachments', taskController.addTaskAttachment);
 
 taskRouter.delete(
   '/:taskId/attachments/:attachmentId',
@@ -143,7 +117,6 @@ taskRouter.delete(
 
 // ═════════════════════════════════════════════════════════════════════════
 // RECOMPUTE PARENT PROJECT PROGRESS
-// (internal tasks return 400 — they have no project to recompute)
 // ═════════════════════════════════════════════════════════════════════════
 
 taskRouter.post(
@@ -169,12 +142,9 @@ taskRouter.post(
 );
 
 // ═════════════════════════════════════════════════════════════════════════
-// HARD DELETE (permanent, main admin only, must be soft-deleted first)
+// HARD DELETE (permanent, main admin only)
 // ═════════════════════════════════════════════════════════════════════════
 
-taskRouter.delete(
-  '/:taskId/permanent',
-  taskController.hardDeleteTask
-);
+taskRouter.delete('/:taskId/permanent', taskController.hardDeleteTask);
 
 export default taskRouter;

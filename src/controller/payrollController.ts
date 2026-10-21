@@ -1155,3 +1155,33 @@ export async function payrollSummary(
     res.status(500).json({ success: false, message: err.message });
   }
 }
+
+// controller/payrollController.ts
+export async function getMyPayroll(req: AuthRequest, res: Response): Promise<void> {
+  try {
+    if (!req.user?.isEmployee) {
+      return bad(res, 'You do not have an employee record', 404);
+    }
+    const emp = await Employee.findOne({ user: req.user._id, isDeleted: false });
+    if (!emp) return bad(res, 'Employee record not found', 404);
+
+    const { year, month } = req.query;
+    const y = Number(year) || new Date().getUTCFullYear();
+    const m = Number(month) || new Date().getUTCMonth() + 1;
+
+    if (!Number.isInteger(y) || y < 2000 || y > 2100) return bad(res, 'Invalid year');
+    if (!Number.isInteger(m) || m < 1 || m > 12) return bad(res, 'Invalid month');
+
+    // Compute but DO NOT apply loan recovery (no side effects for a view)
+    const breakdown = await computePayroll(emp, y, m, {
+      includeOvertimeRequests: true,
+      includeLoanDetails: true,
+      applyLoanRecovery: false,          // ← critical
+    });
+
+    res.json({ success: true, data: breakdown });
+  } catch (err: any) {
+    console.error('getMyPayroll error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+}

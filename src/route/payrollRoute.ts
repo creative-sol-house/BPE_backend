@@ -8,6 +8,17 @@ const payrollRouter = Router();
 
 payrollRouter.use(authenticate);
 
+// ═════════════════════════════════════════════════════════════════════════
+// SELF-SERVICE — no authorize() — controller scopes to req.user._id
+// ═════════════════════════════════════════════════════════════════════════
+
+// GET /api/payroll/me/payslip?year=2026&month=3
+payrollRouter.get('/me/payslip', payrollController.getMyPayroll);
+
+// ═════════════════════════════════════════════════════════════════════════
+// ADMIN ROUTES
+// ═════════════════════════════════════════════════════════════════════════
+
 // ─── Preview one employee's payroll ──────────────────────────────────────
 // GET /api/payroll/preview/:employeeId?year=2026&month=3
 payrollRouter.get(

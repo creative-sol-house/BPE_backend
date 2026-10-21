@@ -21,6 +21,7 @@ import proposalRouter from './proposalRoute';
 import accountingRouter from './accounting';
 import reportRoutes from './reportRoute';
 import employeeBankAccountRoutes from './employeeBankAccountRoutes';
+import meRoute from './meRoute';
 
 const router = Router();
 
@@ -29,6 +30,7 @@ router.use('/auth', authRoutes);
 router.use('/users', userRoutes);
 router.use('/roles', roleRoutes);
 router.use('/uploads', uploadRoutes);
+router.use('/me', meRoute);
 
 // ─── HR / Employees ────────────────────────────────────────────────────
 router.use('/employees', emprouter);

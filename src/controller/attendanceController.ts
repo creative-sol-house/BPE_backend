@@ -41,6 +41,14 @@ function safeSort(raw: unknown): string {
 }
 
 /* ══════════════════════════════════════════════════════════════
+   HELPER — resolve Employee from auth user
+   Accepts ObjectId | string (mongoose-compatible)
+   ══════════════════════════════════════════════════════════════ */
+async function resolveMyEmployee(userId: any) {
+  return Employee.findOne({ user: userId, isDeleted: false });
+}
+
+/* ══════════════════════════════════════════════════════════════
    LIST
    ══════════════════════════════════════════════════════════════ */
 export async function listAttendance(
@@ -685,7 +693,7 @@ export async function getAttendanceStats(
 }
 
 /* ══════════════════════════════════════════════════════════════
-   MY ATTENDANCE
+   MY ATTENDANCE  (self-service list — scoped to logged-in user)
    ══════════════════════════════════════════════════════════════ */
 export async function getMyAttendance(
   req: AuthRequest,
@@ -697,12 +705,7 @@ export async function getMyAttendance(
       return;
     }
 
-    const { from, to, page = '1', limit = '31' } = req.query;
-
-    const emp = await Employee.findOne({
-      user: req.user._id,
-      isDeleted: false,
-    });
+    const emp = await resolveMyEmployee(req.user._id);
     if (!emp) {
       res.status(404).json({
         success: false,
@@ -711,11 +714,17 @@ export async function getMyAttendance(
       return;
     }
 
+    const { from, to, page = '1', limit = '31' } = req.query;
+
     const filter: any = { isDeleted: false, employee: emp._id };
+
     if (from || to) {
       filter.date = {};
-      if (from && isValidISODate(from)) filter.date.$gte = normalizeDate(String(from));
-      if (to && isValidISODate(to)) filter.date.$lte = normalizeDate(String(to));
+      if (from && isValidISODate(from))
+        filter.date.$gte = normalizeDate(String(from));
+      if (to && isValidISODate(to))
+        filter.date.$lte = normalizeDate(String(to));
+      if (Object.keys(filter.date).length === 0) delete filter.date;
     }
 
     const pageNum = Math.max(1, parseInt(page as string));
@@ -744,7 +753,7 @@ export async function getMyAttendance(
 }
 
 /* ══════════════════════════════════════════════════════════════
-   MY TODAY
+   MY TODAY  (self-service — today's record only)
    ══════════════════════════════════════════════════════════════ */
 export async function getMyToday(
   req: AuthRequest,
@@ -756,10 +765,7 @@ export async function getMyToday(
       return;
     }
 
-    const emp = await Employee.findOne({
-      user: req.user._id,
-      isDeleted: false,
-    });
+    const emp = await resolveMyEmployee(req.user._id);
     if (!emp) {
       res.status(404).json({
         success: false,
@@ -785,6 +791,182 @@ export async function getMyToday(
     });
   } catch (err: any) {
     console.error('getMyToday error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   MY MONTHLY  (self-service calendar view — scoped to logged-in user)
+   GET /attendance/me/monthly?year=2025&month=0
+   ══════════════════════════════════════════════════════════════ */
+export async function getMyMonthly(
+  req: AuthRequest,
+  res: Response
+): Promise<void> {
+  try {
+    if (!req.user) {
+      res.status(401).json({ success: false, message: 'Not authenticated' });
+      return;
+    }
+
+    const emp = await resolveMyEmployee(req.user._id);
+    if (!emp) {
+      res.status(404).json({
+        success: false,
+        message: 'No employee record linked to your account',
+      });
+      return;
+    }
+
+    const { year, month } = req.query;
+    if (!year || !month) {
+      res.status(400).json({
+        success: false,
+        message: 'year and month query params are required',
+      });
+      return;
+    }
+
+    const yearNum = parseInt(String(year), 10);
+    const monthNum = parseInt(String(month), 10);
+
+    if (
+      Number.isNaN(yearNum) ||
+      Number.isNaN(monthNum) ||
+      monthNum < 0 ||
+      monthNum > 11
+    ) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid year or month (month is 0-indexed)',
+      });
+      return;
+    }
+
+    const firstDay = new Date(Date.UTC(yearNum, monthNum, 1));
+    const lastDay = new Date(Date.UTC(yearNum, monthNum + 1, 0));
+    const from = normalizeDate(firstDay);
+    const to = normalizeDate(lastDay);
+    const daysInMonth = lastDay.getUTCDate();
+
+    const records = await Attendance.find({
+      employee: emp._id,
+      date: { $gte: from, $lte: to },
+      isDeleted: false,
+    }).sort({ date: 1 });
+
+    const recordMap = new Map<string, any>();
+    records.forEach((rec) => {
+      const d = new Date(rec.date);
+      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(
+        2,
+        '0'
+      )}-${String(d.getUTCDate()).padStart(2, '0')}`;
+      recordMap.set(key, rec);
+    });
+
+    const holidays = await Holiday.find({
+      date: { $gte: from, $lte: to },
+    }).lean();
+    const holidayMap = new Map<string, string>();
+    holidays.forEach((h: any) => {
+      const d = new Date(h.date);
+      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(
+        2,
+        '0'
+      )}-${String(d.getUTCDate()).padStart(2, '0')}`;
+      holidayMap.set(key, h.name);
+    });
+
+    const days: Array<{
+      date: string;
+      dayOfWeek: number;
+      dayOfMonth: number;
+      isWeekend: boolean;
+      holidayName: string | null;
+      record: any | null;
+      status: AttendanceStatus | null;
+    }> = [];
+
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dt = new Date(Date.UTC(yearNum, monthNum, d));
+      const key = `${yearNum}-${String(monthNum + 1).padStart(2, '0')}-${String(
+        d
+      ).padStart(2, '0')}`;
+      const dow = dt.getUTCDay();
+      const weekend = dow === 0 || dow === 6;
+      const holidayName = holidayMap.get(key) || null;
+      const record = recordMap.get(key) || null;
+
+      let status: AttendanceStatus | null = record?.status ?? null;
+      if (!status) {
+        if (holidayName) status = 'holiday';
+        else if (weekend) status = 'weekend';
+      }
+
+      days.push({
+        date: key,
+        dayOfWeek: dow,
+        dayOfMonth: d,
+        isWeekend: weekend,
+        holidayName,
+        record: record
+          ? {
+              _id: record._id,
+              status: record.status,
+              arrivalAt: record.arrivalAt,
+              departureAt: record.departureAt,
+              workedHours: record.workedHours,
+              notes: record.notes,
+              source: record.source,
+            }
+          : null,
+        status,
+      });
+    }
+
+    const summary = {
+      totalDays: daysInMonth,
+      workingDays: days.filter((d) => !d.isWeekend && !d.holidayName).length,
+      present: days.filter((d) => d.status === 'present').length,
+      late: days.filter((d) => d.status === 'late').length,
+      halfDay: days.filter((d) => d.status === 'half_day').length,
+      leave: days.filter((d) => d.status === 'leave').length,
+      absent: days.filter((d) => d.status === 'absent').length,
+      holiday: days.filter((d) => d.status === 'holiday').length,
+      weekend: days.filter((d) => d.status === 'weekend').length,
+      wfh: days.filter((d) => d.status === 'wfh').length,
+      marked: days.filter((d) => d.record !== null).length,
+      totalWorkedHours: days.reduce(
+        (sum, d) => sum + (d.record?.workedHours || 0),
+        0
+      ),
+    };
+
+    res.json({
+      success: true,
+      data: {
+        employee: {
+          _id: emp._id,
+          name: emp.name,
+          employeeId: emp.employeeId,
+          department: emp.department || '',
+          designation: emp.designation || '',
+        },
+        year: yearNum,
+        month: monthNum,
+        monthLabel: new Date(yearNum, monthNum).toLocaleDateString('en-US', {
+          month: 'long',
+          year: 'numeric',
+        }),
+        from,
+        to,
+        days,
+        summary,
+      },
+    });
+  } catch (err: any) {
+    console.error('getMyMonthly error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
 }
@@ -849,7 +1031,7 @@ export async function previewStatus(
 }
 
 /* ══════════════════════════════════════════════════════════════
-   EMPLOYEE MONTHLY ATTENDANCE
+   EMPLOYEE MONTHLY ATTENDANCE  (admin — by employee id)
    ══════════════════════════════════════════════════════════════ */
 export async function getEmployeeMonthlyAttendance(
   req: AuthRequest,

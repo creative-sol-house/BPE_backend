@@ -519,11 +519,13 @@ export async function login(req: AuthRequest, res: Response) {
     } catch (attErr) {
       console.error('login markArrival failed (non-fatal):', attErr);
     }
-
+ 
     const payload = {
       userId: user._id.toString(),
       email: user.email,
       isMainAdmin: user.isMainAdmin,
+        isEmployee: user.isEmployee,   // 👈 ADD THIS ONE LINE
+
     };
 
     const accessToken = signAccessToken(payload);
@@ -573,7 +575,7 @@ export async function refreshToken(req: AuthRequest, res: Response) {
       return res.status(401).json({
         success: false,
         message: 'Refresh token required',
-      });
+      }); 
     }
 
     const payload = verifyRefreshToken(token);
@@ -586,11 +588,12 @@ export async function refreshToken(req: AuthRequest, res: Response) {
       });
     }
 
-    const newPayload = {
-      userId: user._id.toString(),
-      email: user.email,
-      isMainAdmin: user.isMainAdmin,
-    };
+const newPayload = {
+  userId: user._id.toString(),
+  email: user.email,
+  isMainAdmin: user.isMainAdmin,
+  isEmployee: user.isEmployee,   // 👈 keep this in sync with login()
+};
 
     const accessToken = signAccessToken(newPayload);
 
