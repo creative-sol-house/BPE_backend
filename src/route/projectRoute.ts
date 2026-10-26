@@ -26,6 +26,12 @@ projectRouter.get(
 );
 
 // ═════════════════════════════════════════════════════════════════════════
+// SELF-SERVICE: MY PROJECTS  (authenticated only — no permission needed)
+// ═════════════════════════════════════════════════════════════════════════
+
+projectRouter.get('/my-projects', projectController.listMyProjects);
+
+// ═════════════════════════════════════════════════════════════════════════
 // GENERIC LIST / CREATE  (admin)
 // ═════════════════════════════════════════════════════════════════════════
 
@@ -41,10 +47,28 @@ projectRouter.post(
   projectController.createProject
 );
 
+// ═════════════════════════════════════════════════════════════════════════
+// TASKS BY PROJECT  (authenticated only — controller enforces access)
+// ═════════════════════════════════════════════════════════════════════════
+
 projectRouter.get(
   '/:projectId/tasks',
-  authorize('tasks', 'view'),
   taskController.listTasksByProject
+);
+
+projectRouter.post(
+  '/:projectId/tasks',
+  taskController.createTask
+);
+
+projectRouter.patch(
+  '/:projectId/tasks/:taskId',
+  taskController.updateTask
+);
+
+projectRouter.delete(
+  '/:projectId/tasks/:taskId',
+  taskController.deleteTask
 );
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -139,18 +163,20 @@ projectRouter.delete(
 );
 
 // ═════════════════════════════════════════════════════════════════════════
-// SUB-RESOURCE: MILESTONES  (add / remove = admin-only; toggle is above)
+// SUB-RESOURCE: MILESTONES  (add / remove = authenticated only;
+// toggle is above)
+//
+// These routes rely on canActOnProject() inside the controller to enforce
+// "admin OR projects:edit OR is-PM-of-this-project".
 // ═════════════════════════════════════════════════════════════════════════
 
 projectRouter.post(
   '/:projectId/milestones',
-  authorize('projects', 'edit'),
   projectController.addProjectMilestone
 );
 
 projectRouter.delete(
   '/:projectId/milestones/:milestoneId',
-  authorize('projects', 'edit'),
   projectController.removeProjectMilestone
 );
 

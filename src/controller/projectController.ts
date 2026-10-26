@@ -1302,6 +1302,15 @@ export async function addProjectMilestone(req: AuthRequest, res: Response): Prom
       return;
     }
 
+    // ── Permission check: admin OR projects:edit OR PM of this project ──
+    if (!(await canActOnProject(req, project))) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot manage this project\'s milestones',
+      });
+      return;
+    }
+
     const r = validateMilestones([req.body]);
     if (!r.ok || !r.parsed?.length) {
       res.status(400).json({ success: false, message: r.error || 'Invalid milestone' });
@@ -1397,6 +1406,15 @@ export async function removeProjectMilestone(req: AuthRequest, res: Response): P
     const project = await Project.findOne(buildLookupQuery(String(projectId)));
     if (!project) {
       res.status(404).json({ success: false, message: 'Project not found' });
+      return;
+    }
+
+    // ── Permission check: admin OR projects:edit OR PM of this project ──
+    if (!(await canActOnProject(req, project))) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot manage this project\'s milestones',
+      });
       return;
     }
 
@@ -1672,6 +1690,169 @@ export async function changeProjectStatus(req: AuthRequest, res: Response): Prom
     });
   } catch (err: any) {
     console.error('changeProjectStatus error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// LIST MY PROJECTS (no permission required — any authenticated user)
+//   GET /api/projects/my-projects
+//
+// Returns every project the caller is related to in ANY capacity:
+//   • projectManager
+//   • teamMembers
+//   • createdBy
+// No `projects:view` / `projects:edit` permission is checked.
+// ═════════════════════════════════════════════════════════════════════════
+export async function listMyProjects(req: AuthRequest, res: Response): Promise<void> {
+  try {
+    if (!req.user) {
+      res.status(401).json({ success: false, message: 'Not authenticated' });
+      return;
+    }
+
+    const userId = req.user._id;
+
+    const {
+      status,
+      priority,
+      projectType,
+      department,
+      progressMode,
+      // deadline
+      overdue,
+      deadlineBefore,
+      deadlineAfter,
+      // search / misc
+      search,
+      tags,
+      // pagination
+      page = '1',
+      limit = '20',
+      sort = '-createdAt',
+    } = req.query;
+
+    // ── Base: any project the user is related to ─────────────────────────
+    const filter: any = {
+      isDeleted: false,
+      $or: [
+        { projectManager: userId },
+        { teamMembers: userId },
+        { createdBy: userId },
+      ],
+    };
+
+    // ── Status (single or comma-separated) ───────────────────────────────
+    if (status) {
+      const list = String(status)
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s): s is ProjectStatus => (PROJECT_STATUSES as string[]).includes(s));
+      if (list.length === 1) filter.status = list[0];
+      else if (list.length > 1) filter.status = { $in: list };
+    }
+
+    // ── Priority ─────────────────────────────────────────────────────────
+    if (priority) filter.priority = priority;
+
+    // ── projectType (single or comma-separated) ──────────────────────────
+    if (projectType) {
+      const list = String(projectType)
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s): s is ProjectType => (PROJECT_TYPES as string[]).includes(s));
+      if (list.length === 1) filter.projectType = list[0];
+      else if (list.length > 1) filter.projectType = { $in: list };
+    }
+
+    // ── progressMode ─────────────────────────────────────────────────────
+    if (progressMode) {
+      if (!PROJECT_PROGRESS_MODES.includes(progressMode as ProjectProgressMode)) {
+        res.status(400).json({
+          success: false,
+          message: `Invalid progressMode. Allowed: ${PROJECT_PROGRESS_MODES.join(', ')}`,
+        });
+        return;
+      }
+      filter.progressMode = progressMode;
+    }
+
+    // ── department (case-insensitive) ────────────────────────────────────
+    if (department) {
+      filter.department = { $regex: String(department), $options: 'i' };
+    }
+
+    // ── Deadline ─────────────────────────────────────────────────────────
+    if (overdue === 'true') {
+      filter.status = filter.status || { $in: OPEN_PROJECT_STATUSES };
+      filter.deadline = { ...(filter.deadline || {}), $lt: new Date() };
+    } else {
+      if (deadlineBefore) {
+        filter.deadline = {
+          ...(filter.deadline || {}),
+          $lte: new Date(String(deadlineBefore)),
+        };
+      }
+      if (deadlineAfter) {
+        filter.deadline = {
+          ...(filter.deadline || {}),
+          $gte: new Date(String(deadlineAfter)),
+        };
+      }
+    }
+
+    // ── Tags (any-of match) ──────────────────────────────────────────────
+    if (tags) {
+      const tagList = String(tags)
+        .split(',')
+        .map((t) => t.trim())
+        .filter(Boolean);
+      if (tagList.length) filter.tags = { $in: tagList };
+    }
+
+    // ── Search (must be ANDed with the relationship $or) ────────────────
+    // Because `filter.$or` is already used for relationships, we combine
+    // the search predicate with it via `$and` to avoid overwriting it.
+    if (search) {
+      const searchOr = [
+        { name: { $regex: search, $options: 'i' } },
+        { projectId: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+        { department: { $regex: search, $options: 'i' } },
+      ];
+      filter.$and = [...(filter.$and || []), { $or: searchOr }];
+    }
+
+    // ── Pagination ───────────────────────────────────────────────────────
+    const pageNum = Math.max(1, parseInt(page as string));
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit as string)));
+    const skip = (pageNum - 1) * limitNum;
+
+    const [projects, total] = await Promise.all([
+      Project.find(filter)
+        .populate('clientId', 'clientId name clientType status')
+        .populate('leadId', 'leadId name companyName')
+        .populate('projectManager', 'name employeeId designation department')
+        .populate('teamMembers', 'name employeeId designation department')
+        .populate('createdBy', 'name employeeId')
+        .sort(sort as string)
+        .skip(skip)
+        .limit(limitNum),
+      Project.countDocuments(filter),
+    ]);
+
+    res.json({
+      success: true,
+      data: projects,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        pages: Math.ceil(total / limitNum),
+      },
+    });
+  } catch (err: any) {
+    console.error('listMyProjects error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
 }

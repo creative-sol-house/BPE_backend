@@ -49,7 +49,7 @@ async function resolveProject(
     return { ok: false, error: 'Invalid projectId' };
   }
   const p = await Project.findOne({ _id: s, isDeleted: false }).select(
-    '_id taskCategories'
+    '_id taskCategories projectManager teamMembers'
   );
   if (!p) return { ok: false, error: 'Project not found' };
   return { ok: true, projectId: p._id, project: p };
@@ -268,10 +268,7 @@ function validateAttachments(input: any): {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// OWNERSHIP CHECK HELPER
-// Any authenticated user with one of these relationships to the task can
-// view / act on it. Falls back to the corresponding module permission for
-// admins/managers.
+// OWNERSHIP CHECK HELPER (per-task)
 // ═════════════════════════════════════════════════════════════════════════
 type TaskPermissionAction = 'view' | 'add' | 'edit' | 'delete';
 
@@ -284,30 +281,106 @@ async function userCanAccessTask(
   if (req.user.isMainAdmin) return true;
 
   const userId = String(req.user._id);
-  const isAssignee = task.assignedTo && String(task.assignedTo) === userId;
-  const isAssigner = task.assignedBy && String(task.assignedBy) === userId;
-  const isCreator = task.createdBy && String(task.createdBy) === userId;
+
+  // Translate User._id -> Employee._id
+  let employeeId: string | null = null;
+  try {
+    const emp = await Employee.findOne({ user: userId }).select('_id').lean();
+    if (emp) employeeId = String(emp._id);
+  } catch (err) {
+    console.error('Error resolving employee in userCanAccessTask:', err);
+  }
+
+  const assignedToId = task.assignedTo ? String(task.assignedTo._id ?? task.assignedTo) : null;
+  const assignedById = task.assignedBy ? String(task.assignedBy._id ?? task.assignedBy) : null;
+  const createdById = task.createdBy ? String(task.createdBy._id ?? task.createdBy) : null;
+
+  // Check direct relationships (Assignee, Assigner, Creator)
+  const isAssignee =
+    assignedToId === userId || (!!employeeId && assignedToId === employeeId);
+  const isAssigner =
+    assignedById === userId || (!!employeeId && assignedById === employeeId);
+  const isCreator =
+    createdById === userId || (!!employeeId && createdById === employeeId);
+
+  // Check if user is the Project Manager or a Team Member of the populated project
+  let isPM = false;
+  let isTeamMember = false;
+  if (task.projectId && typeof task.projectId === 'object') {
+    const pmId = task.projectId.projectManager 
+      ? String(task.projectId.projectManager._id ?? task.projectId.projectManager) 
+      : null;
+    if (pmId === userId) isPM = true;
+
+    if (Array.isArray(task.projectId.teamMembers)) {
+      isTeamMember = task.projectId.teamMembers.some(
+        (m: any) => String(m._id ?? m) === userId
+      );
+    }
+  }
 
   // For actions like logging time — only the assignee (or an admin) should act
   if (opts.requireAssigneeOnly) {
-    if (isAssignee) return true;
+    if (isAssignee || isPM) return true;
     if (opts.permission && (await req.user.can('tasks', opts.permission))) return true;
     return false;
   }
 
-  if (isAssignee || isAssigner || isCreator) return true;
+  // If they are directly related, a PM, or a team member -> allow
+  if (isAssignee || isAssigner || isCreator || isPM || isTeamMember) {
+    return true;
+  }
 
-  if (opts.permission && (await req.user.can('tasks', opts.permission))) return true;
+  // Fallback: check global permissions
+  if (opts.permission && (await req.user.can('tasks', opts.permission))) {
+    return true;
+  }
+
+  if (opts.permission === 'view' && (await req.user.can('projects', 'view'))) {
+    return true;
+  }
 
   return false;
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+// PROJECT-LEVEL ACCESS HELPER
+// ═════════════════════════════════════════════════════════════════════════
+type ProjectTaskAction = 'view' | 'add';
+
+async function userCanAccessProjectTasks(
+  req: AuthRequest,
+  project: any,
+  action: ProjectTaskAction
+): Promise<boolean> {
+  if (!req.user) return false;
+  if (req.user.isMainAdmin) return true;
+
+  const userId = String(req.user._id);
+
+  const isPM = project.projectManager
+    ? String(project.projectManager?._id ?? project.projectManager) === userId
+    : false;
+  const isTeamMember = (project.teamMembers ?? []).some(
+    (m: any) => String(m?._id ?? m) === userId
+  );
+
+  if (action === 'view') {
+    if (isPM || isTeamMember) return true;
+    if (await req.user.can('projects', 'view')) return true;
+    if (await req.user.can('tasks', 'view')) return true;
+    return false;
+  }
+
+  // action === 'add'
+  if (isPM) return true;
+  if (await req.user.can('tasks', 'add')) return true;
+  if (await req.user.can('projects', 'edit')) return true;
+  return false;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
 // CREATE TASK
-//   POST /api/tasks
-//
-//   `projectId` is OPTIONAL. When omitted/null/empty, the task is created
-//   as an "internal" task (projectId: null, categoryId: null).
 // ═════════════════════════════════════════════════════════════════════════
 export async function createTask(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -332,7 +405,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
       createdBy,
     } = req.body;
 
-    // ── 1. Required fields ──────────────────────────────────────────────
     if (!title || !String(title).trim()) {
       res.status(400).json({ success: false, message: 'title is required' });
       return;
@@ -345,7 +417,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    // ── 2. Project resolution (optional) ────────────────────────────────
     const projectRes = await resolveProject(projectId);
     if (!projectRes.ok) {
       res.status(400).json({ success: false, message: projectRes.error });
@@ -354,7 +425,24 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
     const resolvedProjectId = projectRes.projectId ?? null;
     const isInternal = resolvedProjectId === null;
 
-    // ── 3. Category resolution (guarded) ────────────────────────────────
+    if (!isInternal) {
+      const project = await Project.findOne({
+        _id: resolvedProjectId,
+        isDeleted: false,
+      }).select('_id projectManager teamMembers');
+      if (!project) {
+        res.status(400).json({ success: false, message: 'Project not found' });
+        return;
+      }
+      if (!(await userCanAccessProjectTasks(req, project, 'add'))) {
+        res.status(403).json({
+          success: false,
+          message: 'You cannot add tasks to this project',
+        });
+        return;
+      }
+    }
+
     const categoryRes = await resolveCategoryForProject(
       resolvedProjectId,
       categoryId
@@ -364,21 +452,18 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    // ── 4. Assigned to ──────────────────────────────────────────────────
     const assigneeRes = await resolveEmployee(assignedTo);
     if (!assigneeRes.ok) {
       res.status(400).json({ success: false, message: assigneeRes.error });
       return;
     }
 
-    // ── 5. Assigned by (creator) ────────────────────────────────────────
     const assignerId = req.user?._id;
     if (!assignerId) {
       res.status(401).json({ success: false, message: 'Not authenticated' });
       return;
     }
 
-    // ── 6. Enum checks ──────────────────────────────────────────────────
     if (status !== undefined && !TASK_STATUSES.includes(status)) {
       res.status(400).json({
         success: false,
@@ -394,7 +479,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    // ── 7. Progress check ───────────────────────────────────────────────
     if (progress !== undefined && progress !== null && progress !== '') {
       const p = Number(progress);
       if (!Number.isInteger(p) || p < 0 || p > 100) {
@@ -406,7 +490,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
       }
     }
 
-    // ── 8. Estimated hours check ────────────────────────────────────────
     if (
       estimatedHours !== undefined &&
       estimatedHours !== null &&
@@ -422,7 +505,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
       }
     }
 
-    // ── 9. Parent task (optional) ───────────────────────────────────────
     let resolvedParentId: mongoose.Types.ObjectId | null = null;
     if (parentTaskId) {
       if (!mongoose.Types.ObjectId.isValid(String(parentTaskId))) {
@@ -454,7 +536,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
       resolvedParentId = parent._id;
     }
 
-    // ── 10. Depends-on (optional) ───────────────────────────────────────
     let resolvedDependsOn: mongoose.Types.ObjectId[] = [];
     if (dependsOn !== undefined && dependsOn !== null) {
       if (!Array.isArray(dependsOn)) {
@@ -507,7 +588,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
       resolvedDependsOn = deps.map((d) => d._id);
     }
 
-    // ── 11. createdBy (optional) ────────────────────────────────────────
     let creatorId: mongoose.Types.ObjectId | null = null;
     if (createdBy) {
       const r = await resolveEmployee(createdBy);
@@ -518,7 +598,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
       creatorId = r.id;
     }
 
-    // ── 12. Sub-arrays ──────────────────────────────────────────────────
     const tagsRes = validateTags(tags);
     if (!tagsRes.ok) {
       res.status(400).json({ success: false, message: tagsRes.error });
@@ -540,7 +619,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    // ── 13. Create ──────────────────────────────────────────────────────
     const task = new Task({
       projectId: resolvedProjectId,
       categoryId: categoryRes.categoryId,
@@ -631,7 +709,6 @@ export async function createTask(req: AuthRequest, res: Response): Promise<void>
 
 // ═════════════════════════════════════════════════════════════════════════
 // LIST TASKS (admin)
-//   GET /api/tasks
 // ═════════════════════════════════════════════════════════════════════════
 export async function listTasks(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -785,10 +862,30 @@ export async function listTasks(req: AuthRequest, res: Response): Promise<void> 
 
 // ═════════════════════════════════════════════════════════════════════════
 // LIST MY TASKS
-//   GET /api/tasks/my
 // ═════════════════════════════════════════════════════════════════════════
 export async function listMyTasks(req: AuthRequest, res: Response): Promise<void> {
   try {
+    const userId = req.user?._id;
+    if (!userId) {
+      res.status(401).json({ success: false, message: 'Not authenticated' });
+      return;
+    }
+
+    let employeeId: string | null = null;
+    const emp = await Employee.findOne({ user: userId }).select('_id').lean();
+    if (emp?._id) {
+      employeeId = String(emp._id);
+    }
+
+    if (!employeeId) {
+      res.status(403).json({
+        success: false,
+        message:
+          'No Employee record is linked to your account. Ask an admin to link your user to an employee.',
+      });
+      return;
+    }
+
     const {
       status,
       priority,
@@ -802,15 +899,9 @@ export async function listMyTasks(req: AuthRequest, res: Response): Promise<void
       sort = 'dueDate',
     } = req.query;
 
-    const userId = req.user?._id;
-    if (!userId) {
-      res.status(401).json({ success: false, message: 'Not authenticated' });
-      return;
-    }
-
     const filter: any = {
       isDeleted: false,
-      assignedTo: userId,
+      assignedTo: employeeId,
     };
 
     if (status) {
@@ -866,6 +957,7 @@ export async function listMyTasks(req: AuthRequest, res: Response): Promise<void
     const [tasks, total] = await Promise.all([
       Task.find(filter)
         .populate('assignedBy', 'name employeeId designation')
+        .populate('assignedTo', 'name employeeId designation department')
         .populate('projectId', 'projectId name status')
         .sort(sort as string)
         .skip(skip)
@@ -898,7 +990,9 @@ export async function getTask(req: AuthRequest, res: Response): Promise<void> {
     const idStr = String(taskId);
 
     const task = await Task.findOne(buildLookupQuery(idStr))
-      .populate('projectId', 'projectId name status projectType')
+      // 🚨 CRITICAL FIX: We MUST populate projectManager and teamMembers 
+      // so userCanAccessTask can verify if you are a PM or Team Member!
+      .populate('projectId', 'projectId name status projectType projectManager teamMembers')
       .populate('assignedTo', 'name employeeId designation department phoneNo email')
       .populate('assignedBy', 'name employeeId designation department')
       .populate('createdBy', 'name employeeId')
@@ -915,7 +1009,7 @@ export async function getTask(req: AuthRequest, res: Response): Promise<void> {
       return;
     }
 
-    // ── Ownership check ────────────────────────────────────────────────
+    // ── Bulletproof Permission Check ──────────────────────────────────
     const allowed = await userCanAccessTask(req, task, { permission: 'view' });
     if (!allowed) {
       res.status(403).json({ success: false, message: 'You cannot view this task' });
@@ -944,12 +1038,8 @@ export async function updateTask(req: AuthRequest, res: Response): Promise<void>
     }
 
     // ── Permission check ────────────────────────────────────────────────
-    const isMainAdmin = req.user!.isMainAdmin;
-    const canEdit = await req.user!.can('tasks', 'edit');
-    const isAssignee = String(task.assignedTo) === String(req.user!._id);
-    const isAssigner = String(task.assignedBy) === String(req.user!._id);
-
-    if (!isMainAdmin && !canEdit && !isAssignee && !isAssigner) {
+    const allowed = await userCanAccessTask(req, task, { permission: 'edit' });
+    if (!allowed) {
       res.status(403).json({
         success: false,
         message: 'You cannot edit this task',
@@ -1343,6 +1433,16 @@ export async function assignTask(req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
+    // ── Fixed Permission Check ─────────────────────────────────────────
+    const allowed = await userCanAccessTask(req, task, { permission: 'edit' });
+    if (!allowed) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot reassign this task',
+      });
+      return;
+    }
+
     const r = await resolveEmployee(assignedTo);
     if (!r.ok) {
       res.status(400).json({ success: false, message: r.error });
@@ -1413,7 +1513,6 @@ export async function changeTaskStatus(req: AuthRequest, res: Response): Promise
       return;
     }
 
-    // ── Ownership check ────────────────────────────────────────────────
     const allowed = await userCanAccessTask(req, task, { permission: 'edit' });
     if (!allowed) {
       res.status(403).json({
@@ -1463,11 +1562,8 @@ export async function logTaskTime(req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    // ── Ownership check (assignee only, or tasks:edit) ────────────────
-    const allowed = await userCanAccessTask(req, task, {
-      permission: 'edit',
-      requireAssigneeOnly: true,
-    });
+    // ── Relaxed Permission Check (Viewers can log time) ────────────────
+    const allowed = await userCanAccessTask(req, task, { permission: 'view' });
     if (!allowed) {
       res.status(403).json({
         success: false,
@@ -1531,6 +1627,15 @@ export async function changeTaskEstimate(req: AuthRequest, res: Response): Promi
       return;
     }
 
+    const allowed = await userCanAccessTask(req, task, { permission: 'edit' });
+    if (!allowed) {
+      res.status(403).json({
+        success: false,
+        message: "You cannot change this task's estimate",
+      });
+      return;
+    }
+
     await task.changeEstimate(h, {
       reason: reason ? String(reason).trim().slice(0, 500) : undefined,
       changedBy: req.user?._id ?? null,
@@ -1562,7 +1667,6 @@ export async function addTaskActivity(req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    // ── Ownership check ────────────────────────────────────────────────
     const allowed = await userCanAccessTask(req, task, { permission: 'edit' });
     if (!allowed) {
       res.status(403).json({
@@ -1607,6 +1711,15 @@ export async function removeTaskActivity(req: AuthRequest, res: Response): Promi
       return;
     }
 
+    const allowed = await userCanAccessTask(req, task, { permission: 'edit' });
+    if (!allowed) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot remove activities from this task',
+      });
+      return;
+    }
+
     const before = task.activities.length;
     task.activities = task.activities.filter(
       (a: any) => String(a._id) !== String(activityId)
@@ -1643,7 +1756,6 @@ export async function addTaskComment(req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // ── Ownership check ────────────────────────────────────────────────
     const allowed = await userCanAccessTask(req, task, { permission: 'edit' });
     if (!allowed) {
       res.status(403).json({
@@ -1693,16 +1805,29 @@ export async function removeTaskComment(req: AuthRequest, res: Response): Promis
       return;
     }
 
-    const before = task.comments.length;
-    task.comments = task.comments.filter(
-      (c: any) => String(c._id) !== String(commentId)
+    const comment: any = task.comments.find(
+      (c: any) => String(c._id) === String(commentId)
     );
-
-    if (task.comments.length === before) {
+    if (!comment) {
       res.status(404).json({ success: false, message: 'Comment not found' });
       return;
     }
 
+    const isMainAdmin = req.user!.isMainAdmin;
+    const canEdit = await req.user!.can('tasks', 'edit');
+    const isAuthor = String(comment.author) === String(req.user!._id);
+
+    if (!isMainAdmin && !canEdit && !isAuthor) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot remove this comment',
+      });
+      return;
+    }
+
+    task.comments = task.comments.filter(
+      (c: any) => String(c._id) !== String(commentId)
+    );
     task.markModified('comments');
     await task.save();
 
@@ -1729,7 +1854,6 @@ export async function addTaskAttachment(req: AuthRequest, res: Response): Promis
       return;
     }
 
-    // ── Ownership check ────────────────────────────────────────────────
     const allowed = await userCanAccessTask(req, task, { permission: 'edit' });
     if (!allowed) {
       res.status(403).json({
@@ -1773,6 +1897,15 @@ export async function removeTaskAttachment(req: AuthRequest, res: Response): Pro
       return;
     }
 
+    const allowed = await userCanAccessTask(req, task, { permission: 'edit' });
+    if (!allowed) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot remove attachments from this task',
+      });
+      return;
+    }
+
     const before = task.attachments.length;
     task.attachments = task.attachments.filter(
       (a: any) => String(a._id) !== String(attachmentId)
@@ -1809,16 +1942,14 @@ export async function deleteTask(req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    if (!req.user!.isMainAdmin) {
-      const canDelete = await req.user!.can('tasks', 'delete');
-      const isAssigner = String(task.assignedBy) === String(req.user!._id);
-      if (!canDelete && !isAssigner) {
-        res.status(403).json({
-          success: false,
-          message: 'You cannot delete this task',
-        });
-        return;
-      }
+    // ── Fixed Permission Check ─────────────────────────────────────────
+    const allowed = await userCanAccessTask(req, task, { permission: 'delete' });
+    if (!allowed) {
+      res.status(403).json({
+        success: false,
+        message: 'You cannot delete this task',
+      });
+      return;
     }
 
     task.isDeleted = true;
@@ -2105,6 +2236,16 @@ export async function recomputeFromTask(req: AuthRequest, res: Response): Promis
       return;
     }
 
+    // ── Fixed Permission Check ─────────────────────────────────────────
+    const allowed = await userCanAccessProjectTasks(req, project, 'view');
+    if (!allowed) {
+      res.status(403).json({
+        success: false,
+        message: "You cannot recompute this project's progress",
+      });
+      return;
+    }
+
     await (project as any).recomputeProgressFromTasks();
 
     res.json({
@@ -2139,9 +2280,17 @@ export async function listTasksByProject(req: AuthRequest, res: Response): Promi
     const project = await Project.findOne({
       _id: projectId,
       isDeleted: false,
-    }).select('_id');
+    }).select('_id projectManager teamMembers');
     if (!project) {
       res.status(404).json({ success: false, message: 'Project not found' });
+      return;
+    }
+
+    if (!(await userCanAccessProjectTasks(req, project, 'view'))) {
+      res.status(403).json({
+        success: false,
+        message: "You cannot view this project's tasks",
+      });
       return;
     }
 

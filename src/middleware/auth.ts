@@ -34,11 +34,12 @@ export async function authenticate(
     }
 
     const payload = verifyAccessToken(token);
-
-    const user = await User.findOne({
-      _id: payload.userId,
-      isDeleted: false,
-    }).populate('role');
+const user = await User.findOne({
+  _id: payload.userId,
+  isDeleted: false,
+})
+  .populate('role')
+  .populate('employeeId', '_id name employeeId designation department');
 
     if (!user) {
       res.status(401).json({ success: false, message: 'User not found' });
