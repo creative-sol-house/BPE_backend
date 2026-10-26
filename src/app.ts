@@ -18,7 +18,6 @@ dns.setServers(['8.8.8.8', '1.1.1.1']);
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
 app.set('trust proxy', 1);        // 👈 ADD THIS LINE
 
@@ -83,11 +82,6 @@ app.use((req, res) => {
 app.use(errorHandler);
 
 
-// ─────────────────────────────────────────────
-// Start server
-// ─────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`🚀 Server is running on http://localhost:${PORT}`);
-});
+
 
 export default app;
