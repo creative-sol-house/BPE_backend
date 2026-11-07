@@ -2,10 +2,9 @@ import { Router } from 'express';
 import { authenticate } from '../middleware/auth';
 import * as ctrl from '../controller/attendanceSessionController';
 
-const router = Router();
+const router = Router(); 
 
 // Every route requires login. Self-service routes resolve the
-// session from req.user._id → an employee can never touch
 // another user's data even without explicit permission checks.
 router.use(authenticate);
 
