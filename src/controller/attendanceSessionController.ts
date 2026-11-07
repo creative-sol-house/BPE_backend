@@ -3,7 +3,6 @@ import { Response } from 'express';
 import AttendanceSession, {
   BREAK_LIMIT_MIN,
   CHECK_INTERVAL_MIN,
-
 } from '../model/AttendanceSession';
 import Employee from '../model/employee';
 import { AuthRequest } from '../middleware/auth';
@@ -42,8 +41,6 @@ function fail(res: Response, err: any) {
 
 /* ══════════════════════════════════════════════════════════════
    SELF-SERVICE — ME
-   Every endpoint below resolves session from req.user._id,
-   so an employee can only ever touch their own data.
    ══════════════════════════════════════════════════════════════ */
 
 // ── POST /api/attendance-session/me/start ───────────────────────────────
@@ -172,6 +169,10 @@ export async function getMyToday(req: AuthRequest, res: Response): Promise<void>
     const emp = await resolveMyEmployee(req.user._id);
     if (!emp) return void res.status(404).json({ success: false, message: 'No employee record linked' });
 
+    // 🔥 Calculate missed slots LIVE before returning data
+    // This catches any slot that expired since the last poll
+    await AttendanceSession.markMissedCheckIns(req.user._id);
+
     const today = AttendanceSession.normalizeDate(new Date());
     const session = await AttendanceSession.findOne({
       user: req.user._id,
@@ -252,7 +253,6 @@ export async function getMyMonthly(req: AuthRequest, res: Response): Promise<voi
 
 /* ══════════════════════════════════════════════════════════════
    ADMIN — LIST, VIEW ANY, FORCE-END, MANUAL ADJUST
-   All of these require admin (main admin OR attendance:view).
    ══════════════════════════════════════════════════════════════ */
 
 // ── GET /api/attendance-session?date=&employeeId=&department=&page=&limit= ─
@@ -285,8 +285,12 @@ export async function listSessions(req: AuthRequest, res: Response): Promise<voi
 
     if (employeeId) {
       const v = String(employeeId).trim();
-      filter[newFunction() ? 'employee' : 'employeeId'] =
-        /^[a-f\d]{24}$/i.test(v) ? v : v;
+      // If it's an ObjectId, filter by `employee`, otherwise by `employeeId` string
+      if (/^[a-f\d]{24}$/i.test(v)) {
+        filter.employee = v;
+      } else {
+        filter.employeeId = v;
+      }
     }
 
     if (department) filter.department = String(department);
@@ -324,10 +328,6 @@ export async function listSessions(req: AuthRequest, res: Response): Promise<voi
   } catch (err: any) {
     fail(res, err);
   }
-
-    function newFunction() {
-        return `/^[a-f\\d]{24}$/i.test(v)`;
-    }
 }
 
 // ── GET /api/attendance-session/:id ─────────────────────────────────────
@@ -475,7 +475,7 @@ export async function forceEndSession(req: AuthRequest, res: Response): Promise<
 }
 
 // ── POST /api/attendance-session/:id/reset ──────────────────────────────
-// Soft-deletes the session so the employee can start fresh. Admin-only.
+// Hard-deletes the session so the employee can start fresh. Admin-only.
 export async function resetSession(req: AuthRequest, res: Response): Promise<void> {
   try {
     await requireAdmin(req);
@@ -485,11 +485,10 @@ export async function resetSession(req: AuthRequest, res: Response): Promise<voi
       return void res.status(404).json({ success: false, message: 'Session not found' });
     }
 
-    rec.isDeleted = true;
-    rec.isActive = false;
-    await rec.save();
+    // Hard delete to avoid E11000 duplicate key errors on the unique index
+    await AttendanceSession.deleteOne({ _id: rec._id });
 
-    res.json({ success: true, message: 'Session reset (soft-deleted)' });
+    res.json({ success: true, message: 'Session deleted. Employee can start a new day.' });
   } catch (err: any) {
     fail(res, err);
   }

@@ -220,8 +220,12 @@ async function getOrCreateTodaySession(
 ): Promise<IAttendanceSession> {
   const today = startOfDayUTC();
 
+  // 1. Look for a live session first
   let session = await Model.findOne({ user: userId, date: today, isDeleted: false });
   if (session) return session;
+
+  // 2. Purge any soft-deleted leftovers for today so the unique index doesn't block
+  await Model.deleteMany({ user: userId, date: today, isDeleted: true });
 
   const User = mongoose.model('User');
   const Employee = mongoose.model('Employee');
@@ -231,26 +235,34 @@ async function getOrCreateTodaySession(
 
   const empDoc: any = await Employee.findOne({ user: userId, isDeleted: false }).lean();
 
-  session = await Model.create({
-    employee:     empDoc?._id ?? userDoc._id,
-    user:         userDoc._id,
-    employeeId:   userDoc.employeeId ?? empDoc?.employeeId ?? String(userDoc._id),
-    employeeName: userDoc.name,
-    department:   userDoc.department ?? '',
-    date:         today,
-    startAt:      null,
-    endAt:        null,
-    isActive:     false,
-    checkIns:     [],
-    checkInCount: 0,
-    missedCount:  0,
-    breaks:       [],
-    breakUsedMin: 0,
-    workedMin:    0,
-    workedHours:  0,
-  });
-
-  return session;
+  try {
+    session = await Model.create({
+      employee:     empDoc?._id ?? userDoc._id,
+      user:         userDoc._id,
+      employeeId:   userDoc.employeeId ?? empDoc?.employeeId ?? String(userDoc._id),
+      employeeName: userDoc.name,
+      department:   userDoc.department ?? '',
+      date:         today,
+      startAt:      null,
+      endAt:        null,
+      isActive:     false,
+      checkIns:     [],
+      checkInCount: 0,
+      missedCount:  0,
+      breaks:       [],
+      breakUsedMin: 0,
+      workedMin:    0,
+      workedHours:  0,
+    });
+    return session;
+  } catch (e: any) {
+    // Race condition: another request created it first
+    if (e?.code === 11000) {
+      const existing = await Model.findOne({ user: userId, date: today });
+      if (existing) return existing;
+    }
+    throw e;
+  }
 }
 
 // ── 1. Start Day ────────────────────────────────────────────────────────
@@ -292,19 +304,24 @@ sessionSchema.statics.checkIn = async function (
   if (session.endAt) throw new Error('Day already ended');
 
   const now = new Date();
-  const slot = nextSlot(now);
-
-  // Reject duplicate check-in in the same slot
-  const already = session.checkIns.some(
-    (c) => c.scheduledFor.getTime() === slot.getTime() && c.status === 'done'
-  );
-  if (already) throw new Error('Already checked in for this slot');
-
+  
   // Reject if on break
   const openBreak = session.breaks.find((b) => !b.end);
   if (openBreak) throw new Error('End break before checking in');
 
-  session.checkIns.push({ at: now, scheduledFor: slot, status: 'done' });
+  // Find the very last action (done check-in or end-break reset)
+  const lastAction = [...session.checkIns]
+    .filter(c => c.status === 'done')
+    .sort((a, b) => b.scheduledFor.getTime() - a.scheduledFor.getTime())[0];
+
+  if (lastAction) {
+    const nextAllowed = new Date(lastAction.scheduledFor.getTime() + CHECK_INTERVAL_MIN * 60000);
+    if (now.getTime() < nextAllowed.getTime()) {
+      throw new Error(`Please wait until ${nextAllowed.toLocaleTimeString()}`);
+    }
+  }
+
+  session.checkIns.push({ at: now, scheduledFor: now, status: 'done' });
   session.checkInCount = session.checkIns.filter((c) => c.status === 'done').length;
 
   await session.save();
@@ -321,12 +338,10 @@ sessionSchema.statics.startBreak = async function (
   if (!session.isActive) throw new Error('Day not started');
   if (session.endAt) throw new Error('Day already ended');
 
-  // Already on break?
   if (session.breaks.some((b) => !b.end)) {
     throw new Error('Break already in progress');
   }
 
-  // Break cap reached?
   if (session.breakUsedMin >= BREAK_LIMIT_MIN) {
     throw new Error(`Break limit reached (${BREAK_LIMIT_MIN} min)`);
   }
@@ -358,9 +373,17 @@ sessionSchema.statics.endBreak = async function (
   open.end = now;
   open.durationMin = diffMin(open.start, now);
 
-  // Recompute total — cap at BREAK_LIMIT_MIN
   const total = session.breaks.reduce((s, b) => s + (b.durationMin || 0), 0);
   session.breakUsedMin = Math.min(total, BREAK_LIMIT_MIN);
+
+  // 🔥 RESET 15-MIN TIMER ON BREAK END
+  const nextSlotTime = new Date(now.getTime() + CHECK_INTERVAL_MIN * 60000);
+  session.checkIns.push({
+    at: now,
+    scheduledFor: nextSlotTime,
+    status: 'done',
+  });
+  session.checkInCount = session.checkIns.filter((c) => c.status === 'done').length;
 
   await session.save();
   return session;
@@ -428,9 +451,7 @@ sessionSchema.statics.endDay = async function (
   return session;
 };
 
-// ── 6. Mark Missed Check-Ins ────────────────────────────────────────────
-// Fills every 15-min slot between startAt and `now` (or endAt) that has
-// no 'done' check-in. Idempotent — safe to call repeatedly.
+// ── 6. Mark Missed Check-Ins (Called by Cron) ───────────────────────────
 sessionSchema.statics.markMissedCheckIns = async function (
   this: IAttendanceSessionModel,
   userId,
@@ -439,42 +460,38 @@ sessionSchema.statics.markMissedCheckIns = async function (
   const session = await getOrCreateTodaySession(this, userId);
 
   if (!session.startAt) return 0;
+  if (session.endAt) return 0; // Day is over
 
-  const until = session.endAt ?? now;
-  const slotMs = CHECK_INTERVAL_MIN * 60 * 1000;
+  // 🛑 If currently on a break, do NOT mark missed
+  const openBreak = session.breaks.find((b) => !b.end);
+  if (openBreak) return 0;
 
-  // First slot = rounded-up startAt
-  const firstSlot = nextSlot(session.startAt);
-  const doneSlots = new Set(
-    session.checkIns
-      .filter((c) => c.status === 'done')
-      .map((c) => c.scheduledFor.getTime())
-  );
+  // Find the last action (done check-in or break-end reset)
+  const lastAction = [...session.checkIns]
+    .filter(c => c.status === 'done')
+    .sort((a, b) => b.scheduledFor.getTime() - a.scheduledFor.getTime())[0];
+
+  const lastTime = lastAction ? lastAction.scheduledFor.getTime() : session.startAt.getTime();
+  const nextExpectedSlot = new Date(lastTime + CHECK_INTERVAL_MIN * 60000);
 
   let added = 0;
-  for (let t = firstSlot.getTime(); t <= until.getTime(); t += slotMs) {
-    // Skip slots that fall entirely inside a break
-    const slotDate = new Date(t);
-    const insideBreak = session.breaks.some(
-      (b) =>
-        b.start.getTime() <= t &&
-        (b.end ? b.end.getTime() : until.getTime()) >= t
-    );
-    if (insideBreak) continue;
 
-    if (!doneSlots.has(t)) {
+  // If current time has passed the next expected slot
+  if (now.getTime() >= nextExpectedSlot.getTime()) {
+    const alreadyExists = session.checkIns.some(
+      (c) => c.scheduledFor.getTime() === nextExpectedSlot.getTime()
+    );
+
+    if (!alreadyExists) {
       session.checkIns.push({
-        at: slotDate,
-        scheduledFor: slotDate,
+        at: now,
+        scheduledFor: nextExpectedSlot,
         status: 'missed',
       });
-      added++;
+      session.missedCount = session.checkIns.filter((c) => c.status === 'missed').length;
+      await session.save();
+      added = 1;
     }
-  }
-
-  if (added > 0) {
-    session.missedCount = session.checkIns.filter((c) => c.status === 'missed').length;
-    await session.save();
   }
 
   return added;
