@@ -35,6 +35,7 @@ router.use('/me', meRoute);
 // ─── HR / Employees ────────────────────────────────────────────────────
 router.use('/employees', emprouter);
 router.use('/attendance', attendanceRoutes);
+router.use('/attendance-sessions', require('./attendanceSessionRoutes').default);
 router.use('/holidays', holidayRoutes);
 router.use('/leaves', leaveRoutes);
 router.use('/requests', requestRoutes);
