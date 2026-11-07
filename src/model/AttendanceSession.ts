@@ -198,11 +198,7 @@ const endOfMonthUTC = (d: Date | string = new Date()): Date => {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1));
 };
 
-// Round `now` to the next 15-min boundary (or current if exactly on it)
-const nextSlot = (now: Date): Date => {
-  const ms = 15 * 60 * 1000;
-  return new Date(Math.ceil(now.getTime() / ms) * ms);
-};
+
 
 // ═══════════════════════════════════════════════════════════════════════
 // STATICS — SERVICE LAYER
