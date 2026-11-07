@@ -1,10 +1,9 @@
 // controller/attendanceSessionController.ts
 import { Response } from 'express';
-import mongoose from 'mongoose';
 import AttendanceSession, {
   BREAK_LIMIT_MIN,
   CHECK_INTERVAL_MIN,
-  type IAttendanceSession,
+
 } from '../model/AttendanceSession';
 import Employee from '../model/employee';
 import { AuthRequest } from '../middleware/auth';
