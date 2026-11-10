@@ -3,31 +3,39 @@
 // User, Employee, and all controllers.
 
 export const DEPARTMENTS = [
-  'production',
-  'quality_control',
-  'maintenance',
-  'store',
-  'purchase',
-  'accounts',
+  'management',
+  'administration',
   'hr',
-  'admin',
-  'sales',
-  'it',
+  'accounts',
+  'web_design_development',
+  'mobile_app_development',
+  'software_development',
+  'seo',
+  'marketing',
+  'business_development_international',
+  'business_development_local',
+  'qa_qc',
+  'rnd',
+  'audit',
 ] as const;
 
 export type Department = (typeof DEPARTMENTS)[number];
 
 export const DEPARTMENT_LABELS: Record<Department, string> = {
-  production: 'Production',
-  quality_control: 'Quality Control',
-  maintenance: 'Maintenance',
-  store: 'Store',
-  purchase: 'Purchase',
-  accounts: 'Accounts',
+  management: 'Management',
+  administration: 'Administration',
   hr: 'HR',
-  admin: 'Admin',
-  sales: 'Sales',
-  it: 'IT',
+  accounts: 'Accounts',
+  web_design_development: 'Web Design & Development',
+  mobile_app_development: 'Mobile App Development',
+  software_development: 'Software Development',
+  seo: 'Search Engine Optimization',
+  marketing: 'Marketing',
+  business_development_international: 'Business Development (International)',
+  business_development_local: 'Business Development (Local)',
+  qa_qc: 'QA & QC',
+  rnd: 'R&D',
+  audit: 'Audit (Internal & External)',
 };
 
 // Designation is free-text, but these are the suggested values for the
