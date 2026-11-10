@@ -267,9 +267,10 @@ function pushMissedSlots(session: IAttendanceSession, now: Date): number {
 /**
  * Find the FIRST unrecorded, non-break slot on the grid.
  */
-function getNextExpectedSlot(session: IAttendanceSession): Date | null {
+function getNextExpectedSlot(session: IAttendanceSession, now: Date): Date | null {
   if (!session.scheduledStartAt) return null;
   const intervalMs = (session.scheduleIntervalMin || SLOT_INTERVAL_MIN) * 60_000;
+  
   const recorded = new Set(
     session.checkIns
       .filter((c) => c.type === 'regular' || c.type === 'missed')
@@ -361,11 +362,11 @@ sessionSchema.statics.startDay = async function (this: IAttendanceSessionModel, 
   session.isActive = true;
 
   if (session.isWorkingDay) {
-    // 1) Mark all past grid slots as missed (e.g., if arrived at 12:49, 9:00, 9:30, etc. are missed)
+    // 1) Mark all past grid slots as missed (e.g., 9:00, 9:30, ..., 12:30 are missed)
     pushMissedSlots(session, now);
 
-    // 2) Record "now" as the completion of the *current* grid slot
-    const nextSlot = getNextExpectedSlot(session);
+    // 2) Find the upcoming slot (e.g., 13:00). Record "now" as the check-in for that slot.
+    const nextSlot = getNextExpectedSlot(session, now);
     if (nextSlot && now.getTime() <= nextSlot.getTime() + GRACE_MIN * 60_000) {
       session.checkIns.push({
         at: now,
@@ -398,7 +399,7 @@ sessionSchema.statics.checkIn = async function (this: IAttendanceSessionModel, u
   pushMissedSlots(session, now);
 
   // Find the next slot they are allowed to mark
-  const nextSlot = getNextExpectedSlot(session);
+  const nextSlot = getNextExpectedSlot(session, now);
   if (!nextSlot) throw new Error('No further slots available');
 
   if (now.getTime() > nextSlot.getTime() + GRACE_MIN * 60_000) {
