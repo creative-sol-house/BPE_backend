@@ -266,8 +266,10 @@ function pushMissedSlots(session: IAttendanceSession, now: Date): number {
 
 /**
  * Find the FIRST unrecorded, non-break slot on the grid.
+ * (The `_now` parameter is kept to maintain the function signature, but isn't 
+ * needed for the logic since we just look for the next available slot).
  */
-function getNextExpectedSlot(session: IAttendanceSession, now: Date): Date | null {
+function getNextExpectedSlot(session: IAttendanceSession, _now?: Date): Date | null {
   if (!session.scheduledStartAt) return null;
   const intervalMs = (session.scheduleIntervalMin || SLOT_INTERVAL_MIN) * 60_000;
   
