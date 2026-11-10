@@ -12,49 +12,55 @@ import { AuthRequest } from '../middleware/auth';
    HELPERS
    ══════════════════════════════════════════════════════════════ */
 
-/** Resolve the Employee doc for the logged-in user. */
 async function resolveMyEmployee(userId: any) {
   return Employee.findOne({ user: userId, isDeleted: false });
 }
 
-/** Is the caller an admin? (main admin OR has `attendance:view`) */
 async function isAdmin(req: AuthRequest): Promise<boolean> {
   if (!req.user) return false;
   if (req.user.isMainAdmin) return true;
   return req.user.can('attendance', 'view');
 }
 
-/** Throws if the caller is not an admin. */
 async function requireAdmin(req: AuthRequest): Promise<boolean> {
   const ok = await isAdmin(req);
-  if (!ok) {
-    throw Object.assign(new Error('Admin access required'), { status: 403 });
-  }
+  if (!ok) throw Object.assign(new Error('Admin access required'), { status: 403 });
   return true;
 }
 
-/** Unified error responder. */
 function fail(res: Response, err: any) {
   const status = err?.status ?? 500;
   if (status >= 500) console.error('attendanceSession error:', err);
   res.status(status).json({ success: false, message: err?.message ?? 'Server error' });
 }
 
-/** Compute the next rigid grid slot (e.g. 13:00) */
+/**
+ * Compute the next assignable slot:
+ *   – skip recorded slots (regular / missed / break)
+ *   – skip slots that fall strictly inside a break
+ *   – skip slots whose 5-min grace has already closed (defensive)
+ * Returns the first slot that is either currently within grace, or in the future.
+ */
 function computeNextSlot(session: any): Date | null {
   if (!session?.scheduledStartAt) return null;
-  
+
   const intervalMs = (session.scheduleIntervalMin || SLOT_INTERVAL_MIN) * 60_000;
+  const graceMs = GRACE_MIN * 60_000;
+  const nowMs = Date.now();
+
   const recorded = new Set<number>(
     (session.checkIns || [])
-      .filter((c: any) => c.type === 'regular' || c.type === 'missed')
+      .filter(
+        (c: any) =>
+          c.type === 'regular' || c.type === 'missed' || c.type === 'break'
+      )
       .map((c: any) => new Date(c.scheduledFor).getTime())
   );
 
-  const isInsideBreak = (t: Date) => {
+  const insideBreak = (t: Date) => {
     for (const b of session.breaks || []) {
       const s = new Date(b.start).getTime();
-      const e = b.end ? new Date(b.end).getTime() : Date.now();
+      const e = b.end ? new Date(b.end).getTime() : nowMs;
       if (t.getTime() > s && t.getTime() < e) return true;
     }
     return false;
@@ -62,20 +68,35 @@ function computeNextSlot(session: any): Date | null {
 
   let cursor = new Date(session.scheduledStartAt).getTime();
   for (let i = 0; i < 24 * 60; i++) {
-    const slotDate = new Date(cursor);
-    if (!recorded.has(cursor) && !isInsideBreak(slotDate)) {
-      return slotDate;
+    const slotMs = cursor;
+    const slotDate = new Date(slotMs);
+    const graceCloseMs = slotMs + graceMs;
+
+    // Already recorded → skip
+    if (recorded.has(slotMs)) {
+      cursor += intervalMs;
+      continue;
     }
-    cursor += intervalMs;
+    // Inside a break → skip (won't be markable as a regular check-in)
+    if (insideBreak(slotDate)) {
+      cursor += intervalMs;
+      continue;
+    }
+    // Defensive: grace already closed but not backfilled yet → skip
+    if (graceCloseMs <= nowMs) {
+      cursor += intervalMs;
+      continue;
+    }
+    return slotDate;
   }
   return null;
 }
 
 /* ══════════════════════════════════════════════════════════════
-   SELF-SERVICE — ME
+   SELF-SERVICE
    ══════════════════════════════════════════════════════════════ */
 
-// ── POST /api/attendance-session/me/start ───────────────────────────────
+// POST /api/attendance-session/me/start
 export async function startMyDay(req: AuthRequest, res: Response): Promise<void> {
   try {
     if (!req.user) return void res.status(401).json({ success: false, message: 'Not authenticated' });
@@ -83,6 +104,8 @@ export async function startMyDay(req: AuthRequest, res: Response): Promise<void>
     const emp = await resolveMyEmployee(req.user._id);
     if (!emp) return void res.status(404).json({ success: false, message: 'No employee record linked' });
 
+    // startDay anchors to the employee's assigned check-in time and
+    // backfills every already-expired slot (12:00, 12:30, 1:00 if now 1:12 & shift=12:00).
     const session = await AttendanceSession.startDay(req.user._id);
 
     res.json({
@@ -101,7 +124,7 @@ export async function startMyDay(req: AuthRequest, res: Response): Promise<void>
   }
 }
 
-// ── POST /api/attendance-session/me/check-in ────────────────────────────
+// POST /api/attendance-session/me/check-in
 export async function checkIn(req: AuthRequest, res: Response): Promise<void> {
   try {
     if (!req.user) return void res.status(401).json({ success: false, message: 'Not authenticated' });
@@ -111,10 +134,10 @@ export async function checkIn(req: AuthRequest, res: Response): Promise<void> {
 
     const session = await AttendanceSession.checkIn(req.user._id);
 
-    // Last regular done slot
-    const lastDone = [...session.checkIns]
-      .filter((c) => c.type === 'regular' && c.status === 'done')
-      .sort((a, b) => b.at.getTime() - a.at.getTime())[0] ?? null;
+    const lastDone =
+      [...session.checkIns]
+        .filter((c) => c.type === 'regular' && c.status === 'done')
+        .sort((a, b) => b.at.getTime() - a.at.getTime())[0] ?? null;
 
     res.json({
       success: true,
@@ -131,7 +154,7 @@ export async function checkIn(req: AuthRequest, res: Response): Promise<void> {
   }
 }
 
-// ── POST /api/attendance-session/me/break/start ─────────────────────────
+// POST /api/attendance-session/me/break/start
 export async function startBreak(req: AuthRequest, res: Response): Promise<void> {
   try {
     if (!req.user) return void res.status(401).json({ success: false, message: 'Not authenticated' });
@@ -158,8 +181,6 @@ export async function startBreak(req: AuthRequest, res: Response): Promise<void>
               c.type === 'break-start' &&
               (!openBreak || c.at.getTime() === openBreak.start.getTime())
           ) ?? null,
-        // Slots inside the break are skipped, so the next assignable
-        // slot is the first grid point AFTER the break that isn't recorded.
         nextSlotAt: computeNextSlot(session),
       },
     });
@@ -168,7 +189,7 @@ export async function startBreak(req: AuthRequest, res: Response): Promise<void>
   }
 }
 
-// ── POST /api/attendance-session/me/break/end ───────────────────────────
+// POST /api/attendance-session/me/break/end
 export async function endBreak(req: AuthRequest, res: Response): Promise<void> {
   try {
     if (!req.user) return void res.status(401).json({ success: false, message: 'Not authenticated' });
@@ -176,14 +197,13 @@ export async function endBreak(req: AuthRequest, res: Response): Promise<void> {
     const emp = await resolveMyEmployee(req.user._id);
     if (!emp) return void res.status(404).json({ success: false, message: 'No employee record linked' });
 
+    // endBreak backfills slots inside the break → type:'break', then returns fresh doc
     const session = await AttendanceSession.endBreak(req.user._id);
 
-    // Break-end is recorded as a `done` marker (type=break-end).
-    // The grid is NOT re-anchored — next slot stays on the original schedule
-    // (e.g. break ends 10:37 → next real slot = 11:00).
-    const breakEndMarker = [...session.checkIns]
-      .filter((c) => c.type === 'break-end')
-      .sort((a, b) => b.at.getTime() - a.at.getTime())[0] ?? null;
+    const breakEndMarker =
+      [...session.checkIns]
+        .filter((c) => c.type === 'break-end')
+        .sort((a, b) => b.at.getTime() - a.at.getTime())[0] ?? null;
 
     res.json({
       success: true,
@@ -203,7 +223,7 @@ export async function endBreak(req: AuthRequest, res: Response): Promise<void> {
   }
 }
 
-// ── POST /api/attendance-session/me/end ─────────────────────────────────
+// POST /api/attendance-session/me/end
 export async function endMyDay(req: AuthRequest, res: Response): Promise<void> {
   try {
     if (!req.user) return void res.status(401).json({ success: false, message: 'Not authenticated' });
@@ -232,7 +252,7 @@ export async function endMyDay(req: AuthRequest, res: Response): Promise<void> {
   }
 }
 
-// ── GET /api/attendance-session/me/today ────────────────────────────────
+// GET /api/attendance-session/me/today
 export async function getMyToday(req: AuthRequest, res: Response): Promise<void> {
   try {
     if (!req.user) return void res.status(401).json({ success: false, message: 'Not authenticated' });
@@ -240,8 +260,8 @@ export async function getMyToday(req: AuthRequest, res: Response): Promise<void>
     const emp = await resolveMyEmployee(req.user._id);
     if (!emp) return void res.status(404).json({ success: false, message: 'No employee record linked' });
 
-    // Live-compute missed slots before returning
-    await AttendanceSession.markMissedCheckIns(req.user._id);
+    // Backfill every expired slot (missed / break-overlap) before responding
+    await AttendanceSession.backfillMissedSlots(req.user._id);
 
     const today = AttendanceSession.normalizeDate(new Date());
     const session = await AttendanceSession.findOne({
@@ -285,7 +305,7 @@ export async function getMyToday(req: AuthRequest, res: Response): Promise<void>
   }
 }
 
-// ── GET /api/attendance-session/me/day?date=YYYY-MM-DD ──────────────────
+// GET /api/attendance-session/me/day?date=YYYY-MM-DD
 export async function getMyDay(req: AuthRequest, res: Response): Promise<void> {
   try {
     if (!req.user) return void res.status(401).json({ success: false, message: 'Not authenticated' });
@@ -311,7 +331,7 @@ export async function getMyDay(req: AuthRequest, res: Response): Promise<void> {
   }
 }
 
-// ── GET /api/attendance-session/me/monthly?year=2025&month=0 ────────────
+// GET /api/attendance-session/me/monthly?year=2025&month=0
 export async function getMyMonthly(req: AuthRequest, res: Response): Promise<void> {
   try {
     if (!req.user) return void res.status(401).json({ success: false, message: 'Not authenticated' });
@@ -327,7 +347,10 @@ export async function getMyMonthly(req: AuthRequest, res: Response): Promise<voi
       return void res.status(400).json({ success: false, message: 'Valid year and month (0-11) required' });
     }
 
-    const summary = await AttendanceSession.getMonthlySummary(req.user._id, new Date(Date.UTC(y, m, 1)));
+    const summary = await AttendanceSession.getMonthlySummary(
+      req.user._id,
+      new Date(Date.UTC(y, m, 1))
+    );
 
     res.json({ success: true, data: summary });
   } catch (err: any) {
@@ -336,10 +359,10 @@ export async function getMyMonthly(req: AuthRequest, res: Response): Promise<voi
 }
 
 /* ══════════════════════════════════════════════════════════════
-   ADMIN — LIST, VIEW ANY, FORCE-END, MANUAL ADJUST
+   ADMIN
    ══════════════════════════════════════════════════════════════ */
 
-// ── GET /api/attendance-session?date=&employeeId=&department=&page=&limit= ─
+// GET /api/attendance-session?...
 export async function listSessions(req: AuthRequest, res: Response): Promise<void> {
   try {
     await requireAdmin(req);
@@ -368,11 +391,8 @@ export async function listSessions(req: AuthRequest, res: Response): Promise<voi
 
     if (employeeId) {
       const v = String(employeeId).trim();
-      if (/^[a-f\d]{24}$/i.test(v)) {
-        filter.employee = v;
-      } else {
-        filter.employeeId = v;
-      }
+      if (/^[a-f\d]{24}$/i.test(v)) filter.employee = v;
+      else filter.employeeId = v;
     }
 
     if (department) filter.department = String(department);
@@ -390,45 +410,35 @@ export async function listSessions(req: AuthRequest, res: Response): Promise<voi
     const skip = (pageNum - 1) * limitNum;
 
     const [rows, total] = await Promise.all([
-      AttendanceSession.find(filter)
-        .sort({ date: -1, startAt: -1 })
-        .skip(skip)
-        .limit(limitNum),
+      AttendanceSession.find(filter).sort({ date: -1, startAt: -1 }).skip(skip).limit(limitNum),
       AttendanceSession.countDocuments(filter),
     ]);
 
     res.json({
       success: true,
       data: rows,
-      pagination: {
-        page: pageNum,
-        limit: limitNum,
-        total,
-        pages: Math.ceil(total / limitNum),
-      },
+      pagination: { page: pageNum, limit: limitNum, total, pages: Math.ceil(total / limitNum) },
     });
   } catch (err: any) {
     fail(res, err);
   }
 }
 
-// ── GET /api/attendance-session/:id ─────────────────────────────────────
+// GET /api/attendance-session/:id
 export async function getSession(req: AuthRequest, res: Response): Promise<void> {
   try {
     await requireAdmin(req);
-
     const rec = await AttendanceSession.findById(req.params.id);
     if (!rec || rec.isDeleted) {
       return void res.status(404).json({ success: false, message: 'Session not found' });
     }
-
     res.json({ success: true, data: rec });
   } catch (err: any) {
     fail(res, err);
   }
 }
 
-// ── GET /api/attendance-session/employee/:employeeId/monthly?year=&month= ─
+// GET /api/attendance-session/employee/:employeeId/monthly?year=&month=
 export async function getEmployeeMonthly(req: AuthRequest, res: Response): Promise<void> {
   try {
     await requireAdmin(req);
@@ -473,7 +483,7 @@ export async function getEmployeeMonthly(req: AuthRequest, res: Response): Promi
   }
 }
 
-// ── GET /api/attendance-session/stats?date=YYYY-MM-DD ───────────────────
+// GET /api/attendance-session/stats?date=YYYY-MM-DD
 export async function getDayStats(req: AuthRequest, res: Response): Promise<void> {
   try {
     await requireAdmin(req);
@@ -505,13 +515,8 @@ export async function getDayStats(req: AuthRequest, res: Response): Promise<void
     ]);
 
     const s = agg[0] ?? {
-      total: 0,
-      active: 0,
-      ended: 0,
-      totalCheckIns: 0,
-      totalMissed: 0,
-      totalWorkedMin: 0,
-      totalBreakMin: 0,
+      total: 0, active: 0, ended: 0,
+      totalCheckIns: 0, totalMissed: 0, totalWorkedMin: 0, totalBreakMin: 0,
     };
 
     res.json({
@@ -534,7 +539,7 @@ export async function getDayStats(req: AuthRequest, res: Response): Promise<void
   }
 }
 
-// ── POST /api/attendance-session/:id/force-end ──────────────────────────
+// POST /api/attendance-session/:id/force-end
 export async function forceEndSession(req: AuthRequest, res: Response): Promise<void> {
   try {
     await requireAdmin(req);
@@ -556,8 +561,7 @@ export async function forceEndSession(req: AuthRequest, res: Response): Promise<
   }
 }
 
-// ── POST /api/attendance-session/:id/reset ──────────────────────────────
-// Hard-deletes the session so the employee can start fresh. Admin-only.
+// POST /api/attendance-session/:id/reset
 export async function resetSession(req: AuthRequest, res: Response): Promise<void> {
   try {
     await requireAdmin(req);
@@ -568,15 +572,13 @@ export async function resetSession(req: AuthRequest, res: Response): Promise<voi
     }
 
     await AttendanceSession.deleteOne({ _id: rec._id });
-
     res.json({ success: true, message: 'Session deleted. Employee can start a new day.' });
   } catch (err: any) {
     fail(res, err);
   }
 }
 
-// ── POST /api/attendance-session/:id/adjust-break ───────────────────────
-// Admin manual override of breakUsedMin. Body: { breakUsedMin: number }
+// POST /api/attendance-session/:id/adjust-break
 export async function adjustBreak(req: AuthRequest, res: Response): Promise<void> {
   try {
     await requireAdmin(req);
@@ -596,7 +598,7 @@ export async function adjustBreak(req: AuthRequest, res: Response): Promise<void
 
     rec.breakUsedMin = value;
     if (rec.endAt && rec.startAt) {
-      const totalMin = Math.max(0, Math.round((rec.endAt.getTime() - rec.startAt.getTime()) / 60000));
+      const totalMin = Math.max(0, Math.round((rec.endAt.getTime() - rec.startAt.getTime()) / 60_000));
       rec.workedMin = Math.max(0, totalMin - rec.breakUsedMin);
       rec.workedHours = Math.round((rec.workedMin / 60) * 100) / 100;
     }
