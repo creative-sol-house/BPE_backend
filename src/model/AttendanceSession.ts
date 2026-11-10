@@ -465,26 +465,30 @@ async function getOrCreateTodaySession(
 sessionSchema.statics.normalizeDate = startOfDayUTC;
 
 // ── Start Day ───────────────────────────────────────────────────────────
+// ── Start Day ───────────────────────────────────────────────────────────
 sessionSchema.statics.startDay = async function (
   this: IAttendanceSessionModel,
   userId
 ) {
   const session = await getOrCreateTodaySession(this, userId);
-  if (session.startAt) return session;
+  if (session.startAt) return session; // already started
 
   const now = new Date();
   session.startAt = now;
   session.isActive = true;
 
   if (session.isWorkingDay) {
-    // 1) Mark all grid slots missed that are BEFORE `now` (excl. break windows).
-    pushMissedSlots(session, now);
+    // 🔥 THE FIX: Anchor the 30-min schedule to the exact moment they click Start
+    session.scheduleAnchorAt = now;
 
-    // 2) Find the current assignable grid slot.
+    // Do NOT mark earlier slots as missed, because their shift starts NOW.
+    
+    // Find the slot (which will be exactly `now` based on the new anchor)
     const { slot } = findAssignableSlot(session, now);
     const alreadyRecorded = session.checkIns.some(
       (c) => c.scheduledFor.getTime() === slot.getTime()
     );
+    
     if (!alreadyRecorded) {
       session.checkIns.push({
         at: now,
@@ -493,6 +497,7 @@ sessionSchema.statics.startDay = async function (
         type: 'regular',
       });
     }
+    
     session.checkInCount = session.checkIns.filter(
       (c) => c.status === 'done' && c.type === 'regular'
     ).length;
@@ -502,7 +507,6 @@ sessionSchema.statics.startDay = async function (
   await session.save();
   return session;
 };
-
 // ── Check-In ────────────────────────────────────────────────────────────
 sessionSchema.statics.checkIn = async function (
   this: IAttendanceSessionModel,
