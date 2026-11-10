@@ -195,7 +195,6 @@ export async function endBreak(req: AuthRequest, res: Response): Promise<void> {
         breaks: session.breaks,
         breakEndMarker,
         nextSlotAt: computeNextSlot(session),
-        scheduleAnchorAt: session.scheduleAnchorAt ?? session.scheduledStartAt,
         scheduleIntervalMin: session.scheduleIntervalMin || SLOT_INTERVAL_MIN,
       },
     });
