@@ -9,8 +9,28 @@ import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/
 import { generateOTP, getOTPExpiry } from '../utils/otp';
 import { sendOTPEmail, sendPasswordResetOTPEmail } from '../services/emailService';
 
-// ─── Registration ─────────────────────────────────────────────────────────
+// ─── Cookie options ───────────────────────────────────────────────────────
+// `sameSite: 'none'` + `secure: true` is required for cross-site cookies
+// (frontend on localhost:3000, backend on *.vercel.app). Without these
+// the browser silently drops the Set-Cookie header.
+const isProd = process.env.NODE_ENV === 'production';
 
+const ACCESS_COOKIE_OPTS = {
+  httpOnly: true,
+  secure: isProd,
+  sameSite: (isProd ? 'none' : 'lax') as 'none' | 'lax',
+  path: '/',
+};
+
+const REFRESH_COOKIE_OPTS = {
+  httpOnly: true,
+  secure: isProd,
+  sameSite: (isProd ? 'none' : 'lax') as 'none' | 'lax',
+  path: '/',
+};
+
+const ACCESS_MAX_AGE = 15 * 60 * 1000;                 // 15 min
+const REFRESH_MAX_AGE = 7 * 24 * 60 * 60 * 1000;       // 7 days
 
 // ─── Forgot Password ──────────────────────────────────────────────────────
 export async function forgotPassword(req: AuthRequest, res: Response): Promise<void> {
@@ -24,11 +44,9 @@ export async function forgotPassword(req: AuthRequest, res: Response): Promise<v
 
     const normalized = String(email).trim().toLowerCase();
 
-    // ── 1. Check if user is still pending (awaiting admin approval) ───────
     const pending = await PendingUser.findOne({ email: normalized });
 
     if (pending) {
-      // If they haven't even verified their email yet, they can't reset a password
       if (!pending.isEmailVerified) {
         res.status(403).json({
           success: false,
@@ -39,7 +57,6 @@ export async function forgotPassword(req: AuthRequest, res: Response): Promise<v
         return;
       }
 
-      // Email verified but admin hasn't approved yet
       res.status(403).json({
         success: false,
         message: 'Your account is pending admin approval. You cannot reset your password yet.',
@@ -49,14 +66,12 @@ export async function forgotPassword(req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // ── 2. Check if user exists in the active User collection ─────────────
     const user = await User.findOne({
       email: normalized,
       isDeleted: false,
     });
 
     if (!user) {
-      // Not in pending, not in users → truly no account
       res.status(404).json({
         success: false,
         message: 'No account found with this email address.',
@@ -65,7 +80,6 @@ export async function forgotPassword(req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // ── 3. Block / inactive checks ────────────────────────────────────────
     if (user.status === 'blocked' || !user.isActive) {
       res.status(403).json({
         success: false,
@@ -85,7 +99,6 @@ export async function forgotPassword(req: AuthRequest, res: Response): Promise<v
     }
 
     if (user.status === 'pending') {
-      // Rare: record exists in User but still pending
       res.status(403).json({
         success: false,
         message: 'Your account is pending admin approval.',
@@ -95,7 +108,6 @@ export async function forgotPassword(req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // ── 4. Generate & send reset OTP ──────────────────────────────────────
     const otp = generateOTP();
     await OTP.deleteMany({
       email: normalized,
@@ -126,7 +138,6 @@ export async function forgotPassword(req: AuthRequest, res: Response): Promise<v
     });
   }
 }
-
 
 // ─── Reset Password ───────────────────────────────────────────────────────
 export async function resetPassword(req: AuthRequest, res: Response): Promise<void> {
@@ -201,11 +212,9 @@ export async function resetPassword(req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
-    // Assign plaintext — the User schema's pre-save hook will bcrypt it
     user.password = newPassword;
     await user.save();
 
-    // Mark OTP as used
     otpDoc.isUsed = true;
     await otpDoc.save();
 
@@ -222,8 +231,9 @@ export async function resetPassword(req: AuthRequest, res: Response): Promise<vo
   }
 }
 
-
-export async function register(req: AuthRequest, res: Response) {  console.log('🚀 [register] START');
+// ─── Register ─────────────────────────────────────────────────────────────
+export async function register(req: AuthRequest, res: Response) {
+  console.log('🚀 [register] START');
   try {
     console.log('🚀 [register] inside try');
     const {
@@ -241,7 +251,6 @@ export async function register(req: AuthRequest, res: Response) {  console.log('
       profileImage,
     } = req.body;
 
-    // Check if email/username already exists in User or PendingUser
     const [existingUser, existingPending] = await Promise.all([
       User.findOne({ $or: [{ email: email.toLowerCase() }, { username: username.toLowerCase() }] }),
       PendingUser.findOne({ $or: [{ email: email.toLowerCase() }, { username: username.toLowerCase() }] }),
@@ -254,7 +263,6 @@ export async function register(req: AuthRequest, res: Response) {  console.log('
       });
     }
 
-    // Create pending user
     const pending = await PendingUser.create({
       name,
       username,
@@ -270,7 +278,6 @@ export async function register(req: AuthRequest, res: Response) {  console.log('
       profileImage: profileImage || null,
     });
 
-    // Generate OTP
     const otp = generateOTP();
     await OTP.deleteMany({ email: email.toLowerCase(), purpose: 'email_verification' });
     await OTP.create({
@@ -280,7 +287,6 @@ export async function register(req: AuthRequest, res: Response) {  console.log('
       expiresAt: getOTPExpiry(10),
     });
 
-    // Send OTP email
     await sendOTPEmail(email, otp, name);
 
     return res.status(201).json({
@@ -292,10 +298,10 @@ export async function register(req: AuthRequest, res: Response) {  console.log('
       },
     });
   } catch (err: any) {
-console.error('🚨 [register] CATCH HIT');
-  console.error('   message:', err.message);
-  console.error('   stack:', err.stack);
- return res.status(500).json({
+    console.error('🚨 [register] CATCH HIT');
+    console.error('   message:', err.message);
+    console.error('   stack:', err.stack);
+    return res.status(500).json({
       success: false,
       message: err.message || 'Registration failed',
     });
@@ -345,11 +351,9 @@ export async function verifyEmailOTP(req: AuthRequest, res: Response) {
       });
     }
 
-    // Mark OTP as used
     otpDoc.isUsed = true;
     await otpDoc.save();
 
-    // Update pending user
     const pending = await PendingUser.findOneAndUpdate(
       { email: email.toLowerCase() },
       { isEmailVerified: true },
@@ -427,7 +431,7 @@ export async function resendOTP(req: AuthRequest, res: Response) {
 // ─── Login ────────────────────────────────────────────────────────────────
 export async function login(req: AuthRequest, res: Response) {
   try {
-    const { identifier, password } = req.body; // identifier = email or username
+    const { identifier, password } = req.body;
 
     const normalized = String(identifier || '').trim().toLowerCase();
 
@@ -437,17 +441,15 @@ export async function login(req: AuthRequest, res: Response) {
     }).select('+password');
 
     if (pending) {
-      // If they're in pending but NOT verified yet → tell them to verify email
       if (!pending.isEmailVerified) {
         return res.status(403).json({
           success: false,
           message: 'Please verify your email first. Check your inbox for the OTP.',
           code: 'EMAIL_NOT_VERIFIED',
-          email: pending.email, // frontend uses this to redirect to /verify-otp
+          email: pending.email,
         });
       }
 
-      // Email verified but admin hasn't approved yet
       return res.status(403).json({
         success: false,
         message: 'Your account is pending admin approval.',
@@ -472,7 +474,7 @@ export async function login(req: AuthRequest, res: Response) {
       });
     }
 
-    // ── 3. Status checks for real users ──────────────────────────────────
+    // ── 3. Status checks ─────────────────────────────────────────────────
     if (user.status === 'blocked') {
       return res.status(403).json({
         success: false,
@@ -490,7 +492,6 @@ export async function login(req: AuthRequest, res: Response) {
     }
 
     if (user.status === 'pending') {
-      // Rare: user record exists but still pending
       return res.status(403).json({
         success: false,
         message: 'Your account is pending admin approval.',
@@ -510,39 +511,32 @@ export async function login(req: AuthRequest, res: Response) {
     user.lastLoginAt = new Date();
     await user.save();
 
-    // ── 5. Auto-mark today's arrival ─────────────────────────────────────
-    // Never throws — if the employee isn't linked or something fails, the
-    // service logs the error and returns silently so login still succeeds.
+    // ── 5. Auto-mark today's arrival (non-fatal) ─────────────────────────
     try {
       const { markArrival } = await import('../services/attendanceAutoService');
       await markArrival(user);
     } catch (attErr) {
       console.error('login markArrival failed (non-fatal):', attErr);
     }
- 
+
     const payload = {
       userId: user._id.toString(),
       email: user.email,
       isMainAdmin: user.isMainAdmin,
-        isEmployee: user.isEmployee,   // 👈 ADD THIS ONE LINE
-
+      isEmployee: user.isEmployee,
     };
 
     const accessToken = signAccessToken(payload);
     const refreshToken = signRefreshToken(payload);
 
     res.cookie('accessToken', accessToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      maxAge: 15 * 60 * 1000,
+      ...ACCESS_COOKIE_OPTS,
+      maxAge: ACCESS_MAX_AGE,
     });
 
     res.cookie('refreshToken', refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      maxAge: 7 * 24 * 60 * 60 * 1000,
+      ...REFRESH_COOKIE_OPTS,
+      maxAge: REFRESH_MAX_AGE,
     });
 
     return res.json({
@@ -575,7 +569,7 @@ export async function refreshToken(req: AuthRequest, res: Response) {
       return res.status(401).json({
         success: false,
         message: 'Refresh token required',
-      }); 
+      });
     }
 
     const payload = verifyRefreshToken(token);
@@ -588,20 +582,18 @@ export async function refreshToken(req: AuthRequest, res: Response) {
       });
     }
 
-const newPayload = {
-  userId: user._id.toString(),
-  email: user.email,
-  isMainAdmin: user.isMainAdmin,
-  isEmployee: user.isEmployee,   // 👈 keep this in sync with login()
-};
+    const newPayload = {
+      userId: user._id.toString(),
+      email: user.email,
+      isMainAdmin: user.isMainAdmin,
+      isEmployee: user.isEmployee,
+    };
 
     const accessToken = signAccessToken(newPayload);
 
     res.cookie('accessToken', accessToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      maxAge: 15 * 60 * 1000,
+      ...ACCESS_COOKIE_OPTS,
+      maxAge: ACCESS_MAX_AGE,
     });
 
     return res.json({
@@ -618,9 +610,6 @@ const newPayload = {
 
 // ─── Logout ───────────────────────────────────────────────────────────────
 export async function logout(req: AuthRequest, res: Response) {
-  // ── Auto-mark today's departure ───────────────────────────────────────
-  // Only runs if req.user is populated (requires `authenticate`
-  // middleware on the /logout route).
   try {
     if (req.user) {
       const { markDeparture } = await import('../services/attendanceAutoService');
@@ -630,8 +619,11 @@ export async function logout(req: AuthRequest, res: Response) {
     console.error('logout markDeparture failed (non-fatal):', err);
   }
 
-  res.clearCookie('accessToken');
-  res.clearCookie('refreshToken');
+  // Clear with the same options used when setting — required for
+  // cross-site cookies to be removed by the browser.
+  res.clearCookie('accessToken', { ...ACCESS_COOKIE_OPTS });
+  res.clearCookie('refreshToken', { ...REFRESH_COOKIE_OPTS });
+
   return res.json({ success: true, message: 'Logged out successfully' });
 }
 

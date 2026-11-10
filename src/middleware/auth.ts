@@ -34,12 +34,14 @@ export async function authenticate(
     }
 
     const payload = verifyAccessToken(token);
-const user = await User.findOne({
-  _id: payload.userId,
-  isDeleted: false,
-})
-  .populate('role')
-  .populate('employeeId', '_id name employeeId designation department');
+
+    // Roles have been removed from the system. Load the user plainly —
+    // no `.populate('role')` (no Role model) and no `.populate('employeeId', ...)`
+    // (employeeId is a plain String field on User, not a ref).
+    const user = await User.findOne({
+      _id: payload.userId,
+      isDeleted: false,
+    });
 
     if (!user) {
       res.status(401).json({ success: false, message: 'User not found' });
