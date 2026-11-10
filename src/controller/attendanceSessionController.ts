@@ -40,19 +40,32 @@ function fail(res: Response, err: any) {
   res.status(status).json({ success: false, message: err?.message ?? 'Server error' });
 }
 
-/** Compute the next assignable grid slot (not inside a break, not recorded). */
+/** Compute the next rigid grid slot (e.g. 13:00) */
 function computeNextSlot(session: any): Date | null {
-  const anchor: Date | null = session?.scheduleAnchorAt ?? session?.scheduledStartAt ?? null;
-  if (!anchor) return null;
+  if (!session?.scheduledStartAt) return null;
+  
   const intervalMs = (session.scheduleIntervalMin || SLOT_INTERVAL_MIN) * 60_000;
   const recorded = new Set<number>(
     (session.checkIns || [])
       .filter((c: any) => c.type === 'regular' || c.type === 'missed')
       .map((c: any) => new Date(c.scheduledFor).getTime())
   );
-  let cursor = anchor.getTime();
+
+  const isInsideBreak = (t: Date) => {
+    for (const b of session.breaks || []) {
+      const s = new Date(b.start).getTime();
+      const e = b.end ? new Date(b.end).getTime() : Date.now();
+      if (t.getTime() > s && t.getTime() < e) return true;
+    }
+    return false;
+  };
+
+  let cursor = new Date(session.scheduledStartAt).getTime();
   for (let i = 0; i < 24 * 60; i++) {
-    if (!recorded.has(cursor)) return new Date(cursor);
+    const slotDate = new Date(cursor);
+    if (!recorded.has(cursor) && !isInsideBreak(slotDate)) {
+      return slotDate;
+    }
     cursor += intervalMs;
   }
   return null;
