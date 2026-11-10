@@ -16,7 +16,6 @@ import {
   deriveStatus,
   computeWorkedHours,
 } from '../utils/attendanceHelper';
-import { markAttendanceFromAuth } from '../utils/attendanceAutoMark';
 
 /* ══════════════════════════════════════════════════════════════
    RULES re-export
