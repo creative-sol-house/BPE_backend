@@ -6,10 +6,15 @@ import Attendance, { AttendanceStatus } from './attendance';
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════
 
-export const BREAK_LIMIT_MIN = 75;        // 1h 15m total per day
-export const CHECK_INTERVAL_MIN = 15;     // check-in every 15 min
-export const FULL_DAY_MIN = 8 * 60;       // 8h → "present"
-export const HALF_DAY_MIN = 4 * 60;       // 4h → "half_day"
+export const SLOT_INTERVAL_MIN = 30;      // check-in slot every 30 min
+export const GRACE_MIN        = 10;       // 10-min window to mark a slot
+export const BREAK_LIMIT_MIN  = 75;       // 1h 15m total per day
+export const FULL_DAY_MIN     = 8 * 60;   // 8h → "present"
+export const HALF_DAY_MIN     = 4 * 60;   // 4h → "half_day"
+export const DEFAULT_CHECKIN_HOUR = 9;    // fallback check-in time = 09:00
+export const DEFAULT_CHECKIN_MIN  = 0;
+
+const NON_WORKING_STATUSES: AttendanceStatus[] = ['leave', 'holiday', 'weekend', 'absent'];
 
 // ═══════════════════════════════════════════════════════════════════════
 // TYPES
@@ -18,43 +23,46 @@ export const HALF_DAY_MIN = 4 * 60;       // 4h → "half_day"
 export interface IBreakInterval {
   start: Date;
   end: Date | null;
-  durationMin: number;   // computed on end
+  durationMin: number;
 }
+
+export type CheckInType = 'regular' | 'missed' | 'break-start' | 'break-end';
 
 export interface ICheckIn {
   at: Date;
-  scheduledFor: Date;    // the 15-min slot it belongs to
+  scheduledFor: Date;      // the 30-min grid slot this belongs to
   status: 'done' | 'missed';
+  type: CheckInType;       // 👈 new
 }
 
 export interface IAttendanceSession extends Document {
   _id: Types.ObjectId;
 
-  // ── Identity (denormalized) ─────────────────────────────────────
-  employee: Types.ObjectId;       // ref Employee
-  user: Types.ObjectId;           // ref User
-  employeeId: string;             // "EMP-00001"
+  employee: Types.ObjectId;
+  user: Types.ObjectId;
+  employeeId: string;
   employeeName: string;
   department: string;
 
-  // ── The day (midnight UTC) ─────────────────────────────────────
-  date: Date;
+  date: Date;                       // midnight UTC
 
-  // ── Day lifecycle ──────────────────────────────────────────────
+  scheduledStartAt: Date | null;    // e.g. 09:00 today
+  scheduleIntervalMin: number;      // 30
+  scheduleAnchorAt: Date | null;    // reserved; not mutated by break-end
+
   startAt: Date | null;
   endAt: Date | null;
   isActive: boolean;
 
-  // ── 15-min check-ins ───────────────────────────────────────────
+  isWorkingDay: boolean;
+
   checkIns: ICheckIn[];
   checkInCount: number;
   missedCount: number;
 
-  // ── Breaks ─────────────────────────────────────────────────────
   breaks: IBreakInterval[];
   breakUsedMin: number;
 
-  // ── Derived totals ─────────────────────────────────────────────
   workedMin: number;
   workedHours: number;
 
@@ -65,8 +73,6 @@ export interface IAttendanceSession extends Document {
 
 export interface IAttendanceSessionModel extends Model<IAttendanceSession> {
   normalizeDate(d: Date | string): Date;
-
-  // Service layer (statics)
   startDay(userId: Types.ObjectId | string): Promise<IAttendanceSession>;
   checkIn(userId: Types.ObjectId | string): Promise<IAttendanceSession>;
   startBreak(userId: Types.ObjectId | string): Promise<IAttendanceSession>;
@@ -102,6 +108,11 @@ const checkInSchema = new Schema<ICheckIn>(
     at:           { type: Date, required: true },
     scheduledFor: { type: Date, required: true },
     status:       { type: String, enum: ['done', 'missed'], default: 'done' },
+    type: {
+      type: String,
+      enum: ['regular', 'missed', 'break-start', 'break-end'],
+      default: 'regular',
+    },
   },
   { _id: false }
 );
@@ -134,9 +145,15 @@ const sessionSchema = new Schema<IAttendanceSession, IAttendanceSessionModel>(
       },
     },
 
+    scheduledStartAt:    { type: Date, default: null },
+    scheduleIntervalMin: { type: Number, default: SLOT_INTERVAL_MIN, min: 1 },
+    scheduleAnchorAt:    { type: Date, default: null },
+
     startAt:  { type: Date, default: null },
     endAt:    { type: Date, default: null },
     isActive: { type: Boolean, default: false, index: true },
+
+    isWorkingDay: { type: Boolean, default: true, index: true },
 
     checkIns:     { type: [checkInSchema], default: [] },
     checkInCount: { type: Number, default: 0, min: 0 },
@@ -157,15 +174,10 @@ const sessionSchema = new Schema<IAttendanceSession, IAttendanceSessionModel>(
   }
 );
 
-// ── Indexes ─────────────────────────────────────────────────────────────
 sessionSchema.index({ employee: 1, date: 1 }, { unique: true });
 sessionSchema.index({ user: 1, date: 1 });
 sessionSchema.index({ date: 1, isActive: 1, isDeleted: 1 });
 sessionSchema.index({ department: 1, date: 1 });
-
-// ═══════════════════════════════════════════════════════════════════════
-// HOOKS
-// ═══════════════════════════════════════════════════════════════════════
 
 sessionSchema.pre('validate', function () {
   if (this.isModified('date') && this.date) {
@@ -175,7 +187,7 @@ sessionSchema.pre('validate', function () {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
-// HELPERS
+// DATE HELPERS
 // ═══════════════════════════════════════════════════════════════════════
 
 const diffMin = (a: Date, b: Date): number =>
@@ -198,61 +210,246 @@ const endOfMonthUTC = (d: Date | string = new Date()): Date => {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1));
 };
 
+function parseCheckInTime(raw: any): { hour: number; minute: number } {
+  if (typeof raw === 'string') {
+    const m = raw.trim().match(/^(\d{1,2}):(\d{2})/);
+    if (m) {
+      const h = Math.min(23, Math.max(0, parseInt(m[1], 10)));
+      const mn = Math.min(59, Math.max(0, parseInt(m[2], 10)));
+      return { hour: h, minute: mn };
+    }
+  }
+  if (raw && typeof raw === 'object' && typeof raw.hour === 'number') {
+    return {
+      hour: Math.min(23, Math.max(0, raw.hour | 0)),
+      minute: Math.min(59, Math.max(0, (raw.minute | 0) || 0)),
+    };
+  }
+  return { hour: DEFAULT_CHECKIN_HOUR, minute: DEFAULT_CHECKIN_MIN };
+}
 
+function buildScheduledStart(
+  dateMidnightUTC: Date,
+  hour: number,
+  minute: number
+): Date {
+  const y = dateMidnightUTC.getUTCFullYear();
+  const mo = dateMidnightUTC.getUTCMonth();
+  const da = dateMidnightUTC.getUTCDate();
+  return new Date(Date.UTC(y, mo, da, hour, minute, 0, 0));
+}
 
 // ═══════════════════════════════════════════════════════════════════════
-// STATICS — SERVICE LAYER
+// SLOT MATH
 // ═══════════════════════════════════════════════════════════════════════
 
-sessionSchema.statics.normalizeDate = startOfDayUTC;
+function resolveAnchor(session: IAttendanceSession): Date | null {
+  return session.scheduleAnchorAt ?? session.scheduledStartAt ?? null;
+}
+
+function slotDurationMs(session: IAttendanceSession): number {
+  const interval = session.scheduleIntervalMin || SLOT_INTERVAL_MIN;
+  return interval * 60_000;
+}
+
+
+/** True if `t` falls strictly inside any break interval (open or closed). */
+function isInsideBreak(session: IAttendanceSession, t: Date): boolean {
+  for (const b of session.breaks) {
+    const s = b.start.getTime();
+    const e = (b.end ?? new Date()).getTime();
+    if (t.getTime() >= s && t.getTime() <= e) return true;
+  }
+  return false;
+}
+
+
 
 /**
- * Fetch (or lazily create) today's session for a user.
- * Pulls identity from User + Employee.
+ * Walk the grid from `anchor`. For each slot that has NO record yet:
+ *  - if the slot time falls inside a break → skip (protected time)
+ *  - if the slot + grace has passed → record it as missed
+ *  - else → stop
+ *
+ * Only `regular` and `missed` records count toward "already recorded";
+ * break-start / break-end markers are ignored (they don't own a grid slot).
+ *
+ * Returns number of new missed slots.
  */
+function pushMissedSlots(session: IAttendanceSession, now: Date): number {
+  if (!session.isWorkingDay) return 0;
+  if (session.endAt) return 0;
+  if (!session.startAt) return 0;
+
+  const anchor = resolveAnchor(session);
+  if (!anchor) return 0;
+
+  const intervalMs = slotDurationMs(session);
+  const graceMs = GRACE_MIN * 60_000;
+
+  const recorded = new Set(
+    session.checkIns
+      .filter((c) => c.type === 'regular' || c.type === 'missed')
+      .map((c) => c.scheduledFor.getTime())
+  );
+
+  let added = 0;
+  let cursor = anchor.getTime();
+
+  for (let i = 0; i < 24 * 60; i++) {
+    const slotTs = cursor;
+    const slotDate = new Date(slotTs);
+
+    // Skip slots that fall inside a break — they are protected, not missed
+    if (isInsideBreak(session, slotDate)) {
+      cursor += intervalMs;
+      continue;
+    }
+
+    // Stop once we reach the first slot whose grace window hasn't closed
+    if (slotTs + graceMs >= now.getTime()) break;
+
+    // Skip slots that were already recorded (done or missed)
+    if (recorded.has(slotTs)) {
+      cursor += intervalMs;
+      continue;
+    }
+
+    // Also skip "next slot" if a regular done record sits at a slightly
+    // different offset (late arrival placed the done slot at a grid slot).
+    session.checkIns.push({
+      at: new Date(slotTs + graceMs),
+      scheduledFor: slotDate,
+      status: 'missed',
+      type: 'missed',
+    });
+    recorded.add(slotTs);
+    added++;
+    cursor += intervalMs;
+  }
+
+  if (added > 0) {
+    session.missedCount = session.checkIns.filter((c) => c.status === 'missed').length;
+  }
+  return added;
+}
+
+/**
+ * Given "now", determine the grid slot the user may mark as done.
+ * Returns the earliest un-recorded slot on the grid that is either:
+ *  - inside its grace window right now, OR
+ *  - the next future slot (so early marks land on the correct slot)
+ */
+function findAssignableSlot(
+  session: IAttendanceSession,
+  now: Date
+): { slot: Date; assignable: boolean; missed: Date[] } {
+  const anchor = resolveAnchor(session);
+  if (!anchor) return { slot: now, assignable: true, missed: [] };
+
+  const intervalMs = slotDurationMs(session);
+  const graceMs = GRACE_MIN * 60_000;
+
+  const recorded = new Set(
+    session.checkIns
+      .filter((c) => c.type === 'regular' || c.type === 'missed')
+      .map((c) => c.scheduledFor.getTime())
+  );
+
+  const missed: Date[] = [];
+  let cursor = anchor.getTime();
+
+  for (let i = 0; i < 24 * 60; i++) {
+    const slotTs = cursor;
+    const slotDate = new Date(slotTs);
+
+    if (recorded.has(slotTs)) {
+      cursor += intervalMs;
+      continue;
+    }
+    if (isInsideBreak(session, slotDate)) {
+      cursor += intervalMs;
+      continue;
+    }
+
+    const graceEnd = slotTs + graceMs;
+
+    if (now.getTime() > graceEnd) {
+      // This slot has expired — collect for caller (missed)
+      missed.push(slotDate);
+      recorded.add(slotTs);
+      cursor += intervalMs;
+      continue;
+    }
+
+    // Slot is assignable (we're before or inside its grace window)
+    return { slot: slotDate, assignable: true, missed };
+  }
+
+  return { slot: new Date(cursor), assignable: true, missed };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// GET-OR-CREATE
+// ═══════════════════════════════════════════════════════════════════════
+
 async function getOrCreateTodaySession(
   Model: IAttendanceSessionModel,
   userId: Types.ObjectId | string
 ): Promise<IAttendanceSession> {
   const today = startOfDayUTC();
 
-  // 1. Look for a live session first
   let session = await Model.findOne({ user: userId, date: today, isDeleted: false });
   if (session) return session;
 
-  // 2. Purge any soft-deleted leftovers for today so the unique index doesn't block
   await Model.deleteMany({ user: userId, date: today, isDeleted: true });
 
   const User = mongoose.model('User');
   const Employee = mongoose.model('Employee');
+  const AttendanceM = mongoose.model('Attendance');
 
   const userDoc: any = await User.findById(userId).lean();
   if (!userDoc) throw new Error('User not found');
 
   const empDoc: any = await Employee.findOne({ user: userId, isDeleted: false }).lean();
 
+  const attRow: any = await AttendanceM.findOne({
+    employee: empDoc?._id ?? userDoc._id,
+    date: today,
+    isDeleted: false,
+  }).lean();
+
+  const isWorkingDay = !(attRow && NON_WORKING_STATUSES.includes(attRow.status as AttendanceStatus));
+
+  const raw = empDoc?.checkInTime ?? userDoc?.checkInTime;
+  const { hour, minute } = parseCheckInTime(raw);
+  const scheduledStartAt = buildScheduledStart(today, hour, minute);
+
   try {
     session = await Model.create({
-      employee:     empDoc?._id ?? userDoc._id,
-      user:         userDoc._id,
-      employeeId:   userDoc.employeeId ?? empDoc?.employeeId ?? String(userDoc._id),
-      employeeName: userDoc.name,
-      department:   userDoc.department ?? '',
-      date:         today,
-      startAt:      null,
-      endAt:        null,
-      isActive:     false,
-      checkIns:     [],
-      checkInCount: 0,
-      missedCount:  0,
-      breaks:       [],
-      breakUsedMin: 0,
-      workedMin:    0,
-      workedHours:  0,
+      employee:            empDoc?._id ?? userDoc._id,
+      user:                userDoc._id,
+      employeeId:          userDoc.employeeId ?? empDoc?.employeeId ?? String(userDoc._id),
+      employeeName:        userDoc.name ?? empDoc?.name ?? '',
+      department:          userDoc.department ?? empDoc?.department ?? '',
+      date:                today,
+      scheduledStartAt,
+      scheduleIntervalMin: SLOT_INTERVAL_MIN,
+      scheduleAnchorAt:    null,
+      startAt:             null,
+      endAt:               null,
+      isActive:            false,
+      isWorkingDay,
+      checkIns:            [],
+      checkInCount:        0,
+      missedCount:         0,
+      breaks:              [],
+      breakUsedMin:        0,
+      workedMin:           0,
+      workedHours:         0,
     });
     return session;
   } catch (e: any) {
-    // Race condition: another request created it first
     if (e?.code === 11000) {
       const existing = await Model.findOne({ user: userId, date: today });
       if (existing) return existing;
@@ -261,98 +458,136 @@ async function getOrCreateTodaySession(
   }
 }
 
-// ── 1. Start Day ────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+// STATICS
+// ═══════════════════════════════════════════════════════════════════════
+
+sessionSchema.statics.normalizeDate = startOfDayUTC;
+
+// ── Start Day ───────────────────────────────────────────────────────────
 sessionSchema.statics.startDay = async function (
   this: IAttendanceSessionModel,
   userId
 ) {
   const session = await getOrCreateTodaySession(this, userId);
-
-  if (session.startAt) {
-    // Idempotent — already started
-    return session;
-  }
+  if (session.startAt) return session;
 
   const now = new Date();
   session.startAt = now;
   session.isActive = true;
 
-  // Seed the first check-in slot
-  session.checkIns.push({
-    at: now,
-    scheduledFor: now,
-    status: 'done',
-  });
-  session.checkInCount = 1;
+  if (session.isWorkingDay) {
+    // 1) Mark all grid slots missed that are BEFORE `now` (excl. break windows).
+    pushMissedSlots(session, now);
+
+    // 2) Find the current assignable grid slot.
+    const { slot } = findAssignableSlot(session, now);
+    const alreadyRecorded = session.checkIns.some(
+      (c) => c.scheduledFor.getTime() === slot.getTime()
+    );
+    if (!alreadyRecorded) {
+      session.checkIns.push({
+        at: now,
+        scheduledFor: slot,
+        status: 'done',
+        type: 'regular',
+      });
+    }
+    session.checkInCount = session.checkIns.filter(
+      (c) => c.status === 'done' && c.type === 'regular'
+    ).length;
+    session.missedCount = session.checkIns.filter((c) => c.status === 'missed').length;
+  }
 
   await session.save();
   return session;
 };
 
-// ── 2. Check-In (every 15 min) ──────────────────────────────────────────
+// ── Check-In ────────────────────────────────────────────────────────────
 sessionSchema.statics.checkIn = async function (
   this: IAttendanceSessionModel,
   userId
 ) {
   const session = await getOrCreateTodaySession(this, userId);
 
+  if (!session.isWorkingDay) throw new Error('Not a working day');
   if (!session.isActive) throw new Error('Day not started');
   if (session.endAt) throw new Error('Day already ended');
 
-  const now = new Date();
-  
-  // Reject if on break
   const openBreak = session.breaks.find((b) => !b.end);
   if (openBreak) throw new Error('End break before checking in');
 
-  // Find the very last action (done check-in or end-break reset)
-  const lastAction = [...session.checkIns]
-    .filter(c => c.status === 'done')
-    .sort((a, b) => b.scheduledFor.getTime() - a.scheduledFor.getTime())[0];
+  const now = new Date();
 
-  if (lastAction) {
-    const nextAllowed = new Date(lastAction.scheduledFor.getTime() + CHECK_INTERVAL_MIN * 60000);
-    if (now.getTime() < nextAllowed.getTime()) {
-      throw new Error(`Please wait until ${nextAllowed.toLocaleTimeString()}`);
-    }
+  // Close out anything that already expired
+  pushMissedSlots(session, now);
+
+  const { slot, assignable } = findAssignableSlot(session, now);
+  if (!assignable) throw new Error('No check-in slot available right now');
+
+  if (session.checkIns.some(
+    (c) => c.scheduledFor.getTime() === slot.getTime() &&
+          (c.type === 'regular' || c.type === 'missed')
+  )) {
+    throw new Error('Slot already marked');
   }
 
-  session.checkIns.push({ at: now, scheduledFor: now, status: 'done' });
-  session.checkInCount = session.checkIns.filter((c) => c.status === 'done').length;
+  if (now.getTime() > slot.getTime() + GRACE_MIN * 60_000) {
+    throw new Error(`Slot ${slot.toISOString()} expired; next slot will open soon`);
+  }
+
+  session.checkIns.push({
+    at: now,
+    scheduledFor: slot,
+    status: 'done',
+    type: 'regular',
+  });
+  session.checkInCount = session.checkIns.filter(
+    (c) => c.status === 'done' && c.type === 'regular'
+  ).length;
+  session.missedCount = session.checkIns.filter((c) => c.status === 'missed').length;
 
   await session.save();
   return session;
 };
 
-// ── 3. Start Break ──────────────────────────────────────────────────────
+// ── Start Break ─────────────────────────────────────────────────────────
 sessionSchema.statics.startBreak = async function (
   this: IAttendanceSessionModel,
   userId
 ) {
   const session = await getOrCreateTodaySession(this, userId);
 
+  if (!session.isWorkingDay) throw new Error('Not a working day');
   if (!session.isActive) throw new Error('Day not started');
   if (session.endAt) throw new Error('Day already ended');
 
-  if (session.breaks.some((b) => !b.end)) {
-    throw new Error('Break already in progress');
-  }
-
-  if (session.breakUsedMin >= BREAK_LIMIT_MIN) {
+  if (session.breaks.some((b) => !b.end)) throw new Error('Break already in progress');
+  if (session.breakUsedMin >= BREAK_LIMIT_MIN)
     throw new Error(`Break limit reached (${BREAK_LIMIT_MIN} min)`);
-  }
 
-  session.breaks.push({
-    start: new Date(),
-    end: null,
-    durationMin: 0,
+  const now = new Date();
+
+  // Close out any expired slots BEFORE the break opens (so they aren't
+  // mistaken as "protected time" retroactively).
+  pushMissedSlots(session, now);
+
+  // Persist the break interval
+  session.breaks.push({ start: now, end: null, durationMin: 0 });
+
+  // Audit marker in the check-ins timeline
+  session.checkIns.push({
+    at: now,
+    scheduledFor: now,
+    status: 'done',
+    type: 'break-start',
   });
 
   await session.save();
   return session;
 };
 
-// ── 4. End Break ────────────────────────────────────────────────────────
+// ── End Break ───────────────────────────────────────────────────────────
 sessionSchema.statics.endBreak = async function (
   this: IAttendanceSessionModel,
   userId
@@ -372,20 +607,32 @@ sessionSchema.statics.endBreak = async function (
   const total = session.breaks.reduce((s, b) => s + (b.durationMin || 0), 0);
   session.breakUsedMin = Math.min(total, BREAK_LIMIT_MIN);
 
-  // 🔥 RESET 15-MIN TIMER ON BREAK END
-  const nextSlotTime = new Date(now.getTime() + CHECK_INTERVAL_MIN * 60000);
+  // 🔑 IMPORTANT: DO NOT re-anchor the grid. The next 30-min slot stays on
+  // the original schedule (e.g. break ended 10:37 → next slot is 11:00).
+  // scheduleAnchorAt stays untouched.
+
+  // Record the break-end as a `done` marker in the timeline (audit).
   session.checkIns.push({
     at: now,
-    scheduledFor: nextSlotTime,
+    scheduledFor: now,
     status: 'done',
+    type: 'break-end',
   });
-  session.checkInCount = session.checkIns.filter((c) => c.status === 'done').length;
+
+  // Roll the grid forward: any missed slot up to `now` — but slots inside the
+  // break window were skipped above, so only pre-break slots count.
+  pushMissedSlots(session, now);
+
+  session.checkInCount = session.checkIns.filter(
+    (c) => c.status === 'done' && c.type === 'regular'
+  ).length;
+  session.missedCount = session.checkIns.filter((c) => c.status === 'missed').length;
 
   await session.save();
   return session;
 };
 
-// ── 5. End Day ──────────────────────────────────────────────────────────
+// ── End Day ─────────────────────────────────────────────────────────────
 sessionSchema.statics.endDay = async function (
   this: IAttendanceSessionModel,
   userId
@@ -393,38 +640,62 @@ sessionSchema.statics.endDay = async function (
   const session = await getOrCreateTodaySession(this, userId);
 
   if (!session.isActive) throw new Error('Day not started');
-  if (session.endAt) return session; // idempotent
+  if (session.endAt) return session;
 
   const now = new Date();
 
-  // Auto-close any open break
   const open = session.breaks.find((b) => !b.end);
   if (open) {
     open.end = now;
     open.durationMin = diffMin(open.start, now);
     const total = session.breaks.reduce((s, b) => s + (b.durationMin || 0), 0);
     session.breakUsedMin = Math.min(total, BREAK_LIMIT_MIN);
+    session.checkIns.push({
+      at: now,
+      scheduledFor: now,
+      status: 'done',
+      type: 'break-end',
+    });
   }
 
-  // Any slots between last check-in and endAt that were missed?
-  await (this as IAttendanceSessionModel).markMissedCheckIns(userId, now);
+  pushMissedSlots(session, now);
 
   session.endAt = now;
   session.isActive = false;
 
-  const totalMin = diffMin(session.startAt!, now);
-  session.workedMin = Math.max(0, totalMin - session.breakUsedMin);
-  session.workedHours = Math.round((session.workedMin / 60) * 100) / 100;
+  if (session.isWorkingDay && session.startAt) {
+    const totalMin = diffMin(session.startAt, now);
+    const missedDiscount =
+      (session.missedCount || 0) * (session.scheduleIntervalMin || SLOT_INTERVAL_MIN);
+    session.workedMin = Math.max(0, totalMin - session.breakUsedMin - missedDiscount);
+    session.workedHours = Math.round((session.workedMin / 60) * 100) / 100;
+  } else {
+    session.workedMin = 0;
+    session.workedHours = 0;
+  }
 
   await session.save();
 
-  // ── Sync to existing Attendance model (HR view) ──────────────────
-  const status: AttendanceStatus =
-    session.workedMin >= FULL_DAY_MIN
-      ? 'present'
-      : session.workedMin >= HALF_DAY_MIN
-      ? 'half_day'
+  // Sync to Attendance, respecting manual statuses
+  const existing: any = await Attendance.findOne({
+    employee: session.employee,
+    date: session.date,
+  }).lean();
+
+  let status: AttendanceStatus;
+  if (!session.isWorkingDay) {
+    status = (existing?.status as AttendanceStatus) ?? 'absent';
+  } else if (
+    existing?.source === 'manual' &&
+    ['leave', 'holiday', 'weekend', 'half_day', 'wfh'].includes(existing.status)
+  ) {
+    status = existing.status;
+  } else {
+    status =
+      session.workedMin >= FULL_DAY_MIN ? 'present'
+      : session.workedMin >= HALF_DAY_MIN ? 'half_day'
       : 'absent';
+  }
 
   await Attendance.findOneAndUpdate(
     { employee: session.employee, date: session.date },
@@ -438,69 +709,35 @@ sessionSchema.statics.endDay = async function (
         departureAt:  session.endAt,
         workedHours:  session.workedHours,
         status,
-        source:       'auto',
+        ...(existing?.source === 'manual' ? {} : { source: 'auto' }),
       },
     },
-    { upsert: true }
+    { upsert: true, new: true }
   );
 
   return session;
 };
 
-// ── 6. Mark Missed Check-Ins (Called by Cron) ───────────────────────────
+// ── Mark Missed (cron / polling) ────────────────────────────────────────
 sessionSchema.statics.markMissedCheckIns = async function (
   this: IAttendanceSessionModel,
   userId,
   now: Date = new Date()
 ) {
   const session = await getOrCreateTodaySession(this, userId);
-
-  if (!session.startAt) return 0;
-  if (session.endAt) return 0; // Day is over
-
-  // 🛑 If currently on a break, do NOT mark missed
-  const openBreak = session.breaks.find((b) => !b.end);
-  if (openBreak) return 0;
-
-  // Find the last action (done check-in or break-end reset)
-  const lastAction = [...session.checkIns]
-    .filter(c => c.status === 'done')
-    .sort((a, b) => b.scheduledFor.getTime() - a.scheduledFor.getTime())[0];
-
-  const lastTime = lastAction ? lastAction.scheduledFor.getTime() : session.startAt.getTime();
-  const nextExpectedSlot = new Date(lastTime + CHECK_INTERVAL_MIN * 60000);
-
-  let added = 0;
-
-  // If current time has passed the next expected slot
-  if (now.getTime() >= nextExpectedSlot.getTime()) {
-    const alreadyExists = session.checkIns.some(
-      (c) => c.scheduledFor.getTime() === nextExpectedSlot.getTime()
-    );
-
-    if (!alreadyExists) {
-      session.checkIns.push({
-        at: now,
-        scheduledFor: nextExpectedSlot,
-        status: 'missed',
-      });
-      session.missedCount = session.checkIns.filter((c) => c.status === 'missed').length;
-      await session.save();
-      added = 1;
-    }
-  }
-
+  const added = pushMissedSlots(session, now);
+  if (added > 0) await session.save();
   return added;
 };
 
-// ── 7. Monthly Summary ──────────────────────────────────────────────────
+// ── Monthly Summary ─────────────────────────────────────────────────────
 sessionSchema.statics.getMonthlySummary = async function (
   this: IAttendanceSessionModel,
   userId,
   month: Date
 ) {
   const from = startOfMonthUTC(month);
-  const to   = endOfMonthUTC(month);
+  const to = endOfMonthUTC(month);
 
   const days = await this.find({
     user: userId,
@@ -509,12 +746,14 @@ sessionSchema.statics.getMonthlySummary = async function (
   }).sort({ date: 1 });
 
   const totalWorkedMin = days.reduce((s, d) => s + (d.workedMin || 0), 0);
-  const totalBreakMin  = days.reduce((s, d) => s + (d.breakUsedMin || 0), 0);
-  const totalMissed    = days.reduce((s, d) => s + (d.missedCount || 0), 0);
-  const daysPresent    = days.filter((d) => d.startAt && d.workedMin > 0).length;
+  const totalBreakMin = days.reduce((s, d) => s + (d.breakUsedMin || 0), 0);
+  const totalMissed = days.reduce((s, d) => s + (d.missedCount || 0), 0);
+  const daysPresent = days.filter(
+    (d) => d.isWorkingDay && d.startAt && d.workedMin > 0
+  ).length;
 
   return {
-    month: from.toISOString().slice(0, 7), // "YYYY-MM"
+    month: from.toISOString().slice(0, 7),
     totalWorkedMin,
     totalWorkedHours: Math.round((totalWorkedMin / 60) * 100) / 100,
     totalBreakMin,
