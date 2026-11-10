@@ -1,6 +1,7 @@
 // model/employee.ts
 import mongoose, { Document, Schema, Types, Model } from 'mongoose';
 import Counter from './counter';
+import { DEPARTMENTS, Department, DESIGNATION_MAX_LENGTH } from './constants';
 
 export type Gender = 'male' | 'female';
 
@@ -51,7 +52,7 @@ export interface IEmployee extends Document {
   phoneNo: string;
   cnic: string;
   designation: string;
-  department: string;
+  department: Department | '';
   dateOfJoining: Date;
   gender: Gender;
   dob: Date;
@@ -227,8 +228,24 @@ const employeeSchema = new Schema<IEmployee, IEmployeeModel>(
     email: { type: String, trim: true, lowercase: true, default: undefined },
     phoneNo: { type: String, required: true, trim: true },
     cnic: { type: String, required: true, trim: true },
-    designation: { type: String, required: true, trim: true },
-    department: { type: String, trim: true, default: '' },
+
+    // ── Designation (free text) ──────────────────────────────────────────
+    designation: {
+      type: String,
+      required: true,
+      trim: true,
+      maxlength: DESIGNATION_MAX_LENGTH,
+    },
+
+    // ── Department (fixed enum) ──────────────────────────────────────────
+    department: {
+      type: String,
+      enum: [...DEPARTMENTS, ''],
+      default: '',
+      trim: true,
+      lowercase: true,
+    },
+
     dateOfJoining: { type: Date, required: true },
     gender: { type: String, enum: ['male', 'female'], required: true },
     dob: { type: Date, required: true },

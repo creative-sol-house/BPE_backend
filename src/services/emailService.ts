@@ -18,7 +18,7 @@ interface LayoutOptions {
 }
 
 function emailLayout({
-  tag = 'CS_ERP',
+  tag = 'CMS_ERP',
   title,
   accent = '#2563eb',
   body,
@@ -55,7 +55,7 @@ function emailLayout({
 
   <!-- Preheader (hidden preview text) -->
   <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent; mso-hide:all;">
-    ${title} — CS_ERP
+    ${title} — CMS_ERP
   </div>
 
   <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f3f4f6; padding: 40px 16px;">
@@ -99,10 +99,10 @@ function emailLayout({
           <tr>
             <td style="padding: 24px 40px 32px 40px; color:#6b7280; font-size: 12px; line-height: 1.6;">
               ${footerNote ? `<p style="margin:0 0 12px 0;">${footerNote}</p>` : ''}
-              <p style="margin:0 0 4px 0;"><strong style="color:#374151;">CS_ERP Team</strong></p>
+              <p style="margin:0 0 4px 0;"><strong style="color:#374151;">CMS_ERP Team</strong></p>
               <p style="margin:0;">This is an automated message — please do not reply.</p>
               <p style="margin:16px 0 0 0; color:#9ca3af;">
-                © ${new Date().getFullYear()} CS_ERP · All rights reserved
+                © ${new Date().getFullYear()} CMS_ERP · All rights reserved
               </p>
             </td>
           </tr>
@@ -110,7 +110,7 @@ function emailLayout({
 
         <!-- Sub-footer under card -->
         <p style="margin: 24px 0 0 0; font-size: 11px; color:#9ca3af; font-family: Arial, sans-serif;">
-          You received this email because an account action was performed on CS_ERP.
+          You received this email because an account action was performed on CMS_ERP.
         </p>
       </td>
     </tr>
@@ -127,7 +127,7 @@ export async function sendOTPEmail(email: string, otp: string, name: string) {
   const body = `
     <p style="margin:0 0 16px 0;">Hi <strong>${name}</strong>,</p>
     <p style="margin:0 0 24px 0;">
-      Thanks for signing up with <strong>CS_ERP</strong>. To complete your registration, please use the verification code below:
+      Thanks for signing up with <strong>CMS_ERP</strong>. To complete your registration, please use the verification code below:
     </p>
 
     <!-- OTP Card -->
@@ -154,7 +154,7 @@ export async function sendOTPEmail(email: string, otp: string, name: string) {
     </table>
 
     <p style="margin:0; font-size: 13px; color:#6b7280;">
-      If you didn't create an account with CS_ERP, you can safely ignore this email.
+      If you didn't create an account with CMS_ERP, you can safely ignore this email.
     </p>
   `;
 
@@ -170,29 +170,29 @@ export async function sendOTPEmail(email: string, otp: string, name: string) {
   await getTransporter().sendMail({
     from: getEmailFrom(),
     to: email,
-    subject: '🔐 Verify Your Email — CS_ERP',
+    subject: '🔐 Verify Your Email — CMS_ERP',
     html,
     // Plain-text fallback for clients that don't render HTML
-    text: `Hi ${name},\n\nYour CS_ERP verification code is: ${otp}\n\nThis code expires in 10 minutes.\n\n— CS_ERP Team`,
+    text: `Hi ${name},\n\nYour CMS_ERP verification code is: ${otp}\n\nThis code expires in 10 minutes.\n\n— CMS_ERP Team`,
   });
     console.log('📧 [sendOTPEmail] sendMail OK');
 
 }
 
 // ─── Approval Email ───────────────────────────────────────────────────────
+// ─── Approval Email ───────────────────────────────────────────────────────
 export async function sendApprovalEmail(
   email: string,
   name: string,
-  department: string,
-  role: string
+  department: string
 ) {
   const body = `
     <p style="margin:0 0 16px 0;">Hi <strong>${name}</strong>,</p>
     <p style="margin:0 0 24px 0;">
-      Great news — your CS_ERP account has been <strong style="color:#16a34a;">approved</strong> by the administrator. Welcome aboard! 🎉
+      Great news — your CMS_ERP account has been <strong style="color:#16a34a;">approved</strong> by the administrator. Welcome aboard! 🎉
     </p>
 
-    <!-- Credentials card -->
+    <!-- Assignment card -->
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin: 8px 0 24px 0; background:#f0fdf4; border-radius: 12px; border: 1px solid #bbf7d0;">
       <tr>
         <td style="padding: 20px 22px;">
@@ -201,16 +201,12 @@ export async function sendApprovalEmail(
           </div>
           <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
             <tr>
-              <td style="padding: 6px 0; font-size: 14px; color:#374151; width: 120px;">👤 Username</td>
+              <td style="padding: 6px 0; font-size: 14px; color:#374151; width: 120px;">👤 Email</td>
               <td style="padding: 6px 0; font-size: 14px; color:#111827; font-weight: 600;">${email}</td>
             </tr>
             <tr>
               <td style="padding: 6px 0; font-size: 14px; color:#374151;">🏢 Department</td>
               <td style="padding: 6px 0; font-size: 14px; color:#111827; font-weight: 600;">${department}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 0; font-size: 14px; color:#374151;">🎯 Role</td>
-              <td style="padding: 6px 0; font-size: 14px; color:#111827; font-weight: 600;">${role}</td>
             </tr>
           </table>
         </td>
@@ -222,7 +218,7 @@ export async function sendApprovalEmail(
 
   const html = emailLayout({
     tag: 'Account Approved',
-    title: 'Welcome to CS_ERP! 🎉',
+    title: 'Welcome to CMS_ERP! 🎉',
     accent: '#16a34a',
     body,
     footerNote: 'If you weren\'t expecting this, please contact your administrator immediately.',
@@ -231,9 +227,9 @@ export async function sendApprovalEmail(
   await getTransporter().sendMail({
     from: getEmailFrom(),
     to: email,
-    subject: '✅ Your CS_ERP Account is Approved',
+    subject: '✅ Your CMS_ERP Account is Approved',
     html,
-    text: `Hi ${name},\n\nYour CS_ERP account has been approved.\n\nDepartment: ${department}\nRole: ${role}\n\nYou can now log in with your email and password.\n\n— CS_ERP Team`,
+    text: `Hi ${name},\n\nYour CMS_ERP account has been approved.\n\nDepartment: ${department}\n\nYou can now log in with your email and password.\n\n— CMS_ERP Team`,
   });
 }
 
@@ -259,11 +255,11 @@ export async function sendBlockedEmail(email: string, name: string, reason?: str
   const body = `
     <p style="margin:0 0 16px 0;">Hi <strong>${name}</strong>,</p>
     <p style="margin:0 0 20px 0;">
-      We regret to inform you that your CS_ERP account has been <strong style="color:#dc2626;">blocked</strong> by an administrator.
+      We regret to inform you that your CMS_ERP account has been <strong style="color:#dc2626;">blocked</strong> by an administrator.
     </p>
     ${reasonBlock}
     <p style="margin:0 0 12px 0;">
-      While blocked, you will not be able to sign in or access any CS_ERP resources.
+      While blocked, you will not be able to sign in or access any CMS_ERP resources.
     </p>
     <p style="margin:0; font-size: 13px; color:#6b7280;">
       If you believe this was a mistake, please reach out to your administrator to appeal.
@@ -275,15 +271,15 @@ export async function sendBlockedEmail(email: string, name: string, reason?: str
     title: 'Your Account Has Been Blocked',
     accent: '#dc2626',
     body,
-    footerNote: 'This action was taken by an authorised CS_ERP administrator.',
+    footerNote: 'This action was taken by an authorised CMS_ERP administrator.',
   });
 
   await getTransporter().sendMail({
     from: getEmailFrom(),
     to: email,
-    subject: '🚫 Your CS_ERP Account Has Been Blocked',
+    subject: '🚫 Your CMS_ERP Account Has Been Blocked',
     html,
-    text: `Hi ${name},\n\nYour CS_ERP account has been blocked.\n${reason ? `Reason: ${reason}\n` : ''}\nContact your administrator if you believe this is a mistake.\n\n— CS_ERP Team`,
+    text: `Hi ${name},\n\nYour CMS_ERP account has been blocked.\n${reason ? `Reason: ${reason}\n` : ''}\nContact your administrator if you believe this is a mistake.\n\n— CMS_ERP Team`,
   });
 }
 
@@ -309,7 +305,7 @@ export async function sendRejectionEmail(email: string, name: string, reason?: s
   const body = `
     <p style="margin:0 0 16px 0;">Hi <strong>${name}</strong>,</p>
     <p style="margin:0 0 20px 0;">
-      Thank you for your interest in CS_ERP. After reviewing your registration request, we are unable to approve your account at this time.
+      Thank you for your interest in CMS_ERP. After reviewing your registration request, we are unable to approve your account at this time.
     </p>
     ${reasonBlock}
     <p style="margin:0 0 12px 0;">
@@ -325,15 +321,15 @@ export async function sendRejectionEmail(email: string, name: string, reason?: s
     title: 'Registration Request Update',
     accent: '#dc2626',
     body,
-    footerNote: 'This decision was made by an authorised CS_ERP administrator.',
+    footerNote: 'This decision was made by an authorised CMS_ERP administrator.',
   });
 
   await getTransporter().sendMail({
     from: getEmailFrom(),
     to: email,
-    subject: 'CS_ERP — Registration Request Update',
+    subject: 'CMS_ERP — Registration Request Update',
     html,
-    text: `Hi ${name},\n\nWe're unable to approve your CS_ERP registration at this time.\n${reason ? `Reason: ${reason}\n` : ''}\n— CS_ERP Team`,
+    text: `Hi ${name},\n\nWe're unable to approve your CMS_ERP registration at this time.\n${reason ? `Reason: ${reason}\n` : ''}\n— CMS_ERP Team`,
   });
 }
 
@@ -347,23 +343,23 @@ export async function sendPasswordResetOTPEmail(
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
       <h2 style="color: #dc2626;">🔐 Password Reset</h2>
       <p>Hi ${name},</p>
-      <p>You requested to reset your CS_ERP password. Use the code below to continue:</p>
+      <p>You requested to reset your CMS_ERP password. Use the code below to continue:</p>
       <div style="background: #f3f4f6; padding: 20px; text-align: center; border-radius: 8px; margin: 20px 0;">
         <h1 style="letter-spacing: 8px; color: #1f2937; margin: 0;">${otp}</h1>
       </div>
       <p>This code will expire in <strong>10 minutes</strong>.</p>
       <p style="color:#dc2626;"><strong>If you didn't request this, ignore this email and consider changing your password immediately.</strong></p>
       <br/>
-      <p>Regards,<br/>CS_ERP Team</p>
+      <p>Regards,<br/>CMS_ERP Team</p>
     </div>
   `;
 
   await getTransporter().sendMail({
     from: getEmailFrom(),
     to: email,
-    subject: '🔐 Reset Your CS_ERP Password',
+    subject: '🔐 Reset Your CMS_ERP Password',
     html,
-    text: `Hi ${name},\n\nYour CS_ERP password reset code is: ${otp}\n\nIt expires in 10 minutes.\nIf you didn't request this, ignore this email.\n\n— CS_ERP Team`,
+    text: `Hi ${name},\n\nYour CMS_ERP password reset code is: ${otp}\n\nIt expires in 10 minutes.\nIf you didn't request this, ignore this email.\n\n— CMS_ERP Team`,
   });
 }
 
@@ -381,7 +377,7 @@ export async function sendUserCreatedEmail(
   const body = `
     <p style="margin:0 0 16px 0;">Hi <strong>${name}</strong>,</p>
     <p style="margin:0 0 24px 0;">
-      Welcome to <strong>CS_ERP</strong>! An account has been created for you by an administrator. Use the credentials below to sign in:
+      Welcome to <strong>CMS_ERP</strong>! An account has been created for you by an administrator. Use the credentials below to sign in:
     </p>
 
     <!-- Credentials card -->
@@ -441,21 +437,21 @@ export async function sendUserCreatedEmail(
 
   const html = emailLayout({
     tag: 'Welcome',
-    title: 'Your CS_ERP account is ready',
+    title: 'Your CMS_ERP account is ready',
     accent: '#0D9488',
     body,
-    cta: { label: 'Sign in to CS_ERP', url: loginUrl },
-    footerNote: 'This account was created for you by an authorised CS_ERP administrator.',
+    cta: { label: 'Sign in to CMS_ERP', url: loginUrl },
+    footerNote: 'This account was created for you by an authorised CMS_ERP administrator.',
   });
 
   await getTransporter().sendMail({
     from: getEmailFrom(),
     to: email,
-    subject: '👋 Your CS_ERP account is ready',
+    subject: '👋 Your CMS_ERP account is ready',
     html,
     text: `Hi ${name},
 
-An account has been created for you on CS_ERP.
+An account has been created for you on CMS_ERP.
 
 Email: ${email}
 Username: ${username}
@@ -464,6 +460,6 @@ ${role ? `Role: ${role}\n` : ''}${department ? `Department: ${department}\n` : '
 Please sign in and change your password immediately:
 ${loginUrl}
 
-— CS_ERP Team`,
+— CMS_ERP Team`,
   });
 }

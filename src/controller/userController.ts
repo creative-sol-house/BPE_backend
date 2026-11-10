@@ -2,7 +2,6 @@
 import { Response } from 'express';
 import User from '../model/user';
 import PendingUser from '../model/pendingUser';
-import Role from '../model/role';
 import '../model/employee';                                 // 👈 register Employee model for hooks
 import Employee, {
   SALARY_STRUCTURES,
@@ -12,6 +11,7 @@ import Employee, {
   type SalaryStructure,
 } from '../model/employee';                                 // 👈 typed access
 import { AuthRequest } from '../middleware/auth';
+import { DEPARTMENTS, Department, DESIGNATION_MAX_LENGTH } from '../model/constants';
 import {
   sendApprovalEmail,
   sendBlockedEmail,
@@ -40,6 +40,46 @@ interface ParsedSchedule {
   endYear?: number;
   endMonth?: number;
   notes?: string;
+}
+
+/**
+ * Validate department input against the fixed DEPARTMENTS enum.
+ * Returns the normalized lowercase value, or '' if not provided.
+ */
+function validateDepartment(
+  input: any
+): { ok: boolean; error?: string; value?: Department | '' } {
+  if (input === undefined) return { ok: true };
+  if (input === null) return { ok: true, value: '' };
+  const raw = String(input).trim().toLowerCase();
+  if (raw === '') return { ok: true, value: '' };
+  if (!(DEPARTMENTS as readonly string[]).includes(raw)) {
+    return {
+      ok: false,
+      error: `department must be one of: ${DEPARTMENTS.join(', ')}`,
+    };
+  }
+  return { ok: true, value: raw as Department };
+}
+
+/**
+ * Validate designation input (free text).
+ * Returns normalized trimmed value, or undefined if not provided.
+ */
+function validateDesignation(
+  input: any
+): { ok: boolean; error?: string; value?: string } {
+  if (input === undefined) return { ok: true };
+  if (input === null) return { ok: true, value: '' };
+  const v = String(input).trim();
+  if (v === '') return { ok: true, value: '' };
+  if (v.length > DESIGNATION_MAX_LENGTH) {
+    return {
+      ok: false,
+      error: `designation must be ≤ ${DESIGNATION_MAX_LENGTH} characters`,
+    };
+  }
+  return { ok: true, value: v };
 }
 
 /**
@@ -333,12 +373,12 @@ export async function approveUser(req: AuthRequest, res: Response): Promise<void
   try {
     const {
       pendingUserId,
-      roleId,
       department,
+      designation,
       permissions,
       permissionMode,
       isEmployee,
-      isMainAdmin,                                  // 👈 main admin flag
+      isMainAdmin,
 
       // 👇 extras (salary / timings / leave)
       salaryStructure,
@@ -391,27 +431,19 @@ export async function approveUser(req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    // Validate role & department
-    let roleDoc: any = null;
-    if (roleId) {
-      roleDoc = await Role.findOne({ _id: roleId, isDeleted: false, isActive: true });
-      if (!roleDoc) {
-        res.status(400).json({ success: false, message: 'Invalid role' });
-        return;
-      }
-      if (department) {
-        const hasDept = roleDoc.departments.some(
-          (d: any) => d.name.trim().toLowerCase() === department.trim().toLowerCase()
-        );
-        if (!hasDept) {
-          res.status(400).json({
-            success: false,
-            message: `Department "${department}" is not defined in role "${roleDoc.name}"`,
-          });
-          return;
-        }
-      }
+    // ── Validate department + designation ────────────────────────────────
+    const deptRes = validateDepartment(department);
+    if (!deptRes.ok) {
+      res.status(400).json({ success: false, message: deptRes.error });
+      return;
     }
+
+    const desigRes = validateDesignation(designation !== undefined ? designation : pending.designation);
+    if (!desigRes.ok) {
+      res.status(400).json({ success: false, message: desigRes.error });
+      return;
+    }
+    const finalDesignation = desigRes.value ?? pending.designation;
 
     // Create user from pending (password is already bcrypt-hashed)
     const user = new User({
@@ -423,12 +455,11 @@ export async function approveUser(req: AuthRequest, res: Response): Promise<void
       gender: pending.gender,
       cnic: pending.cnic,
       phoneNo: pending.phoneNo,
-      designation: pending.designation,
+      designation: finalDesignation,
       dateOfJoining: pending.dateOfJoining,
       address: pending.address,
       profileImage: pending.profileImage,
-      role: roleId || null,
-      department: department || '',
+      department: deptRes.value ?? '',
       permissions: permissions || [],
       permissionMode: permissionMode || 'override',
       status: 'active',
@@ -476,8 +507,7 @@ export async function approveUser(req: AuthRequest, res: Response): Promise<void
     await sendApprovalEmail(
       user.email,
       user.name,
-      department || 'N/A',
-      roleDoc?.name || 'N/A'
+      deptRes.value || 'N/A'
     );
 
     // Return the linked Employee record (may be null if isEmployee === false)
@@ -593,7 +623,6 @@ export async function listUsers(req: AuthRequest, res: Response): Promise<void> 
     const {
       status,
       department,
-      role,
       search,
       isEmployee,
       page = '1',
@@ -603,13 +632,13 @@ export async function listUsers(req: AuthRequest, res: Response): Promise<void> 
     const filter: any = { isDeleted: false };
     if (status) filter.status = status;
     if (department) filter.department = department;
-    if (role) filter.role = role;
     if (isEmployee !== undefined) filter.isEmployee = isEmployee === 'true';
     if (search) {
       filter.$or = [
         { name: { $regex: search, $options: 'i' } },
         { email: { $regex: search, $options: 'i' } },
         { username: { $regex: search, $options: 'i' } },
+        { designation: { $regex: search, $options: 'i' } },
       ];
     }
 
@@ -619,7 +648,6 @@ export async function listUsers(req: AuthRequest, res: Response): Promise<void> 
 
     const [users, total] = await Promise.all([
       User.find(filter)
-        .populate('role')
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limitNum),
@@ -647,7 +675,7 @@ export async function getUser(req: AuthRequest, res: Response): Promise<void> {
     const user = await User.findOne({
       _id: req.params.userId,
       isDeleted: false,
-    }).populate('role');
+    });
 
     if (!user) {
       res.status(404).json({ success: false, message: 'User not found' });
@@ -754,7 +782,6 @@ export async function updateUser(req: AuthRequest, res: Response): Promise<void>
       gender,
       dob,
       cnic,
-      role,
       department,
       permissions,
       permissionMode,
@@ -770,7 +797,7 @@ export async function updateUser(req: AuthRequest, res: Response): Promise<void>
       pieceRateSalary,
       overtimePerHourAmount,
 
-      // 👇 timings + leave (NEW)
+      // 👇 timings + leave
       standardCheckIn,
       standardCheckOut,
       leaveSchedules,
@@ -843,45 +870,17 @@ export async function updateUser(req: AuthRequest, res: Response): Promise<void>
       }
     }
 
-    // ── Changing role/department requires roles:edit (non-admins) ──
-    if ((role !== undefined || department !== undefined) && !req.user!.isMainAdmin) {
-      if (!(await req.user!.can('roles', 'edit'))) {
-        res.status(403).json({
-          success: false,
-          message: 'You cannot change role/department without roles:edit',
-        });
-        return;
-      }
+    // ── Validate department + designation ────────────────────────────────
+    const deptRes = validateDepartment(department);
+    if (!deptRes.ok) {
+      res.status(400).json({ success: false, message: deptRes.error });
+      return;
     }
 
-    // ── Validate role & department pairing ──
-    if (role !== undefined || department !== undefined) {
-      const newRole = role ?? user.role;
-      const newDept = department ?? user.department;
-
-      if (newRole) {
-        const roleDoc = await Role.findOne({
-          _id: newRole,
-          isDeleted: false,
-          isActive: true,
-        });
-        if (!roleDoc) {
-          res.status(400).json({ success: false, message: 'Invalid role' });
-          return;
-        }
-        const hasDept = roleDoc.departments.some(
-          (d: any) =>
-            d.name.trim().toLowerCase() ===
-            String(newDept).trim().toLowerCase()
-        );
-        if (!hasDept) {
-          res.status(400).json({
-            success: false,
-            message: `Department "${newDept}" is not defined in role "${roleDoc.name}"`,
-          });
-          return;
-        }
-      }
+    const desigRes = validateDesignation(designation);
+    if (!desigRes.ok) {
+      res.status(400).json({ success: false, message: desigRes.error });
+      return;
     }
 
     // ── Username validation + uniqueness ──
@@ -979,12 +978,15 @@ export async function updateUser(req: AuthRequest, res: Response): Promise<void>
     }
     if (phoneNo !== undefined) user.phoneNo = phoneNo;
     if (address !== undefined) user.address = address;
-    if (designation !== undefined) user.designation = designation;
+    if (designation !== undefined && desigRes.value !== undefined) {
+      user.designation = desigRes.value;
+    }
     if (gender !== undefined) user.gender = gender;
     if (dob !== undefined) user.dob = dob;
     if (cnic !== undefined) user.cnic = cnic;
-    if (role !== undefined) user.role = role;
-    if (department !== undefined) user.department = department;
+    if (department !== undefined && deptRes.value !== undefined) {
+      user.department = deptRes.value;
+    }
     if (permissions !== undefined) user.permissions = permissions;
     if (permissionMode !== undefined) user.permissionMode = permissionMode;
     if (isActive !== undefined) user.isActive = isActive;
@@ -1104,7 +1106,6 @@ export async function createUser(req: AuthRequest, res: Response): Promise<void>
       dateOfJoining,
       address,
       profileImage,
-      role: roleId,
       department,
       permissions,
       permissionMode,
@@ -1156,7 +1157,24 @@ export async function createUser(req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    // ── 2. Uniqueness checks (case-insensitive) ──────────────────────────
+    // ── 2. Validate department + designation ─────────────────────────────
+    const deptRes = validateDepartment(department);
+    if (!deptRes.ok) {
+      res.status(400).json({ success: false, message: deptRes.error });
+      return;
+    }
+
+    const desigRes = validateDesignation(designation);
+    if (!desigRes.ok) {
+      res.status(400).json({ success: false, message: desigRes.error });
+      return;
+    }
+    if (!desigRes.value) {
+      res.status(400).json({ success: false, message: 'designation is required' });
+      return;
+    }
+
+    // ── 3. Uniqueness checks (case-insensitive) ──────────────────────────
     const normalizedEmail = String(email).trim().toLowerCase();
     const normalizedUsername = String(username).trim().toLowerCase();
 
@@ -1187,7 +1205,7 @@ export async function createUser(req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    // ── 3. Can't grant permissions you don't hold (non-admins) ───────────
+    // ── 4. Can't grant permissions you don't hold (non-admins) ───────────
     if (permissions && permissions.length && !req.user!.isMainAdmin) {
       for (const p of permissions) {
         for (const a of p.actions) {
@@ -1211,46 +1229,7 @@ export async function createUser(req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    // ── 4. Assigning role/department requires roles:edit (non-admins) ────
-    if ((roleId || department) && !req.user!.isMainAdmin) {
-      if (!(await req.user!.can('roles', 'edit'))) {
-        res.status(403).json({
-          success: false,
-          message: 'You cannot assign role/department without roles:edit',
-        });
-        return;
-      }
-    }
-
-    // ── 5. Validate role + department pairing ────────────────────────────
-    let roleDoc: any = null;
-    if (roleId) {
-      roleDoc = await Role.findOne({
-        _id: roleId,
-        isDeleted: false,
-        isActive: true,
-      });
-      if (!roleDoc) {
-        res.status(400).json({ success: false, message: 'Invalid role' });
-        return;
-      }
-      if (department) {
-        const hasDept = roleDoc.departments.some(
-          (d: any) =>
-            d.name.trim().toLowerCase() ===
-            String(department).trim().toLowerCase()
-        );
-        if (!hasDept) {
-          res.status(400).json({
-            success: false,
-            message: `Department "${department}" is not defined in role "${roleDoc.name}"`,
-          });
-          return;
-        }
-      }
-    }
-
-    // ── 6. Create the user ───────────────────────────────────────────────
+    // ── 5. Create the user ───────────────────────────────────────────────
     const user = new User({
       name: String(name).trim(),
       username: normalizedUsername,
@@ -1260,12 +1239,11 @@ export async function createUser(req: AuthRequest, res: Response): Promise<void>
       gender,
       cnic,
       phoneNo,
-      designation,
+      designation: desigRes.value,
       dateOfJoining,
       address: address || undefined,
       profileImage: profileImage || null,
-      role: roleId || null,
-      department: department || '',
+      department: deptRes.value ?? '',
       permissions: permissions || [],
       permissionMode: permissionMode || 'override',
       status: 'active',
@@ -1278,7 +1256,7 @@ export async function createUser(req: AuthRequest, res: Response): Promise<void>
 
     await user.save(); // post('save') hook creates Employee if isEmployee
 
-    // ── 6b. Apply salary / timings / leave to the freshly-created Employee ─
+    // ── 5b. Apply salary / timings / leave to the freshly-created Employee ─
     const hasExtras =
       salaryStructure !== undefined ||
       basicSalary !== undefined ||
@@ -1308,15 +1286,15 @@ export async function createUser(req: AuthRequest, res: Response): Promise<void>
       }
     }
 
-    // ── 7. Send welcome email (best-effort — never fail the request) ─────
+    // ── 6. Send welcome email (best-effort — never fail the request) ─────
     try {
       await sendUserCreatedEmail(
         user.email,
         user.name,
         user.username,
         password,
-        roleDoc?.name,
-        department
+        undefined,                    // role name — no longer exists
+        deptRes.value || ''
       );
     } catch (emailErr) {
       console.error('createUser: welcome email failed:', emailErr);

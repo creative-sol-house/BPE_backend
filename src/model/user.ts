@@ -1,5 +1,7 @@
 // model/User.ts
 import mongoose, { Document, Schema, Types, Model } from 'mongoose';
+
+import { DEPARTMENTS, Department, DESIGNATION_MAX_LENGTH } from './constants';
 import bcrypt from 'bcryptjs';
 import { deleteImage } from '../middleware/uploads';
 
@@ -33,8 +35,8 @@ export interface IUser extends Document {
   email: string;
   password: string;
 
-  role: Types.ObjectId | null;
-  department: string;
+  department: Department | '';
+
   isMainAdmin: boolean;
   isActive: boolean;
   status: UserStatus;
@@ -53,7 +55,7 @@ export interface IUser extends Document {
   designation: string;
   dateOfJoining: Date;
   employeeId?: string;
-  isEmployee: boolean;               // 👈 NEW
+  isEmployee: boolean;
 
   address?: string;
   emergencyContact?: IEmergencyContact;
@@ -142,14 +144,21 @@ const userSchema = new Schema<IUser, IUserModel>(
     },
     password: {
       type: String,
-      required: [true, 'Password is required'], 
+      required: [true, 'Password is required'],
       minlength: 6,
       select: false,
     },
 
-    role: { type: Schema.Types.ObjectId, ref: 'Role', default: null },
-    department: { type: String, trim: true, default: '' },
-isMainAdmin: { type: Boolean, default: false },
+    // ── Department (fixed enum) ──────────────────────────────────────────
+    department: {
+      type: String,
+      enum: [...DEPARTMENTS, ''],
+      default: '',
+      trim: true,
+      lowercase: true,
+    },
+
+    isMainAdmin: { type: Boolean, default: false },
     isActive: { type: Boolean, default: true },
     status: {
       type: String,
@@ -187,7 +196,13 @@ isMainAdmin: { type: Boolean, default: false },
     },
     profileImage: { type: profileImageSchema, default: null },
 
-    designation: { type: String, required: true, trim: true, maxlength: 100 },
+    // ── Designation (free text) ──────────────────────────────────────────
+    designation: {
+      type: String,
+      required: true,
+      trim: true,
+      maxlength: DESIGNATION_MAX_LENGTH,
+    },
     dateOfJoining: {
       type: Date,
       required: true,
@@ -198,7 +213,6 @@ isMainAdmin: { type: Boolean, default: false },
     },
     employeeId: { type: String, trim: true, sparse: true, unique: true },
 
-    // 👇 NEW: defaults to true — every user is an employee unless told otherwise
     isEmployee: { type: Boolean, default: true },
 
     address: { type: String, trim: true, maxlength: 250 },
@@ -229,7 +243,7 @@ isMainAdmin: { type: Boolean, default: false },
   }
 );
 
-userSchema.index({ role: 1, isActive: 1 });
+// ─── Indexes ──────────────────────────────────────────────────────────────
 userSchema.index({ department: 1, isActive: 1 });
 userSchema.index({ isDeleted: 1 });
 userSchema.index({ status: 1 });
@@ -246,28 +260,6 @@ userSchema.pre('save', async function () {
 
 userSchema.pre('validate', function () {
   if (this.employeeId === '' || this.employeeId === null) this.employeeId = undefined;
-});
-
-userSchema.pre('save', async function () {
-  if (!this.isModified('role') && !this.isModified('department')) return;
-  if (!this.role) return;
-
-  const Role = mongoose.model('Role');
-  const roleDoc: any = await Role.findOne({
-    _id: this.role,
-    isDeleted: false,
-    isActive: true,
-  });
-  if (!roleDoc) throw new Error('Referenced role does not exist or is inactive');
-
-  const hasDept = roleDoc.departments.some(
-    (d: any) => d.name.trim().toLowerCase() === this.department.trim().toLowerCase()
-  );
-  if (!hasDept) {
-    throw new Error(
-      `Department "${this.department}" is not defined inside role "${roleDoc.name}"`
-    );
-  }
 });
 
 userSchema.pre('save', async function () {
@@ -302,7 +294,7 @@ userSchema.pre('findOneAndDelete', async function () {
     }
   }
 
-  // 👇 Remove linked employee record
+  // Remove linked employee record
   if (doc?._id) {
     try {
       const Employee = mongoose.model('Employee');
@@ -313,7 +305,7 @@ userSchema.pre('findOneAndDelete', async function () {
   }
 });
 
-// ─── Keep Employee record in sync with User ───────────────────────────
+// ─── Keep Employee record in sync with User ──────────────────────────────
 userSchema.post('save', async function (doc) {
   try {
     const Employee = mongoose.model('Employee');
@@ -329,7 +321,7 @@ userSchema.post('save', async function (doc) {
 
     const payload = {
       name: doc.name,
-      email: doc.email,                           // 👈 MUST BE HERE
+      email: doc.email,
       phoneNo: doc.phoneNo,
       cnic: doc.cnic,
       designation: doc.designation,
@@ -366,75 +358,22 @@ userSchema.methods.comparePassword = function (candidate: string) {
   return bcrypt.compare(candidate, this.password);
 };
 
+/**
+ * Effective permissions are now sourced ONLY from the user's own
+ * `permissions` array — roles have been removed from the system.
+ * `isMainAdmin` still short-circuits to full wildcard access.
+ * `permissionMode` is kept on the document for backward compatibility
+ * but no longer affects the result.
+ */
 userSchema.methods.getEffectivePermissions = async function (): Promise<IUserPermission[]> {
   if (this.isMainAdmin) {
     return [{ module: '*', actions: ['view', 'add', 'edit', 'delete'] }];
   }
 
-  let rolePerms: IUserPermission[] = [];
-
-  // ── Handle both populated (object) and unpopulated (ObjectId) role ──
-  if (this.role && this.department) {
-    let roleDoc: any = this.role;
-
-    // If role is just an ObjectId (not populated), fetch it
-    if (!roleDoc.departments) {
-      const Role = mongoose.model('Role');
-      roleDoc = await Role.findById(roleDoc).lean();
-    }
-
-    if (roleDoc?.departments) {
-      const dept = roleDoc.departments.find(
-        (d: any) =>
-          d.name.trim().toLowerCase() === this.department.trim().toLowerCase()
-      );
-      if (dept?.modules) {
-        rolePerms = dept.modules.map((p: any) => ({
-          module: String(p.module).toLowerCase(),
-          actions: [...p.actions] as PermissionAction[],
-        }));
-      }
-    }
-  }
-
-  const userPerms: IUserPermission[] = (this.permissions || []).map(
-    (p: { module: string; actions: any }) => ({
-      module: p.module.toLowerCase(),
-      actions: [...p.actions] as PermissionAction[],
-    })
-  );
-
-  const merge = (
-    base: IUserPermission[],
-    overlay: IUserPermission[],
-    mode: 'union' | 'replace'
-  ): IUserPermission[] => {
-    const map = new Map<string, Set<PermissionAction>>();
-    for (const p of base) map.set(p.module, new Set(p.actions));
-    for (const p of overlay) {
-      if (mode === 'replace') {
-        map.set(p.module, new Set(p.actions));
-      } else {
-        const existing = map.get(p.module) ?? new Set<PermissionAction>();
-        for (const a of p.actions) existing.add(a);
-        map.set(p.module, existing);
-      }
-    }
-    return [...map.entries()].map(([module, set]) => ({
-      module,
-      actions: [...set] as PermissionAction[],
-    }));
-  };
-
-  switch (this.permissionMode) {
-    case 'replace':
-      return userPerms;
-    case 'extend':
-      return merge(rolePerms, userPerms, 'union');
-    case 'override':
-    default:
-      return merge(rolePerms, userPerms, 'replace');
-  }
+  return (this.permissions || []).map((p: { module: string; actions: any }) => ({
+    module: String(p.module).toLowerCase(),
+    actions: [...p.actions] as PermissionAction[],
+  }));
 };
 
 userSchema.methods.can = async function (
@@ -463,9 +402,7 @@ userSchema.statics.findByCredentials = function (identifier: string) {
       { username: identifier.toLowerCase() },
     ],
     isDeleted: false,
-  })
-    .select('+password')
-    .populate('role');
+  }).select('+password');
 };
 
 const User =

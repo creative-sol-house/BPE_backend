@@ -12,8 +12,8 @@ import Employee, {
   type SalaryStructure,
 } from '../model/employee';
 import User from '../model/user';
-import Role from '../model/role';
 import { AuthRequest } from '../middleware/auth';
+import { DEPARTMENTS, Department, DESIGNATION_MAX_LENGTH } from '../model/constants';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -39,6 +39,46 @@ function validateTimings(checkIn?: string, checkOut?: string): string | null {
     }
   }
   return null;
+}
+
+/**
+ * Validate department input against the fixed DEPARTMENTS enum.
+ * Returns the normalized lowercase value, or '' if not provided.
+ */
+function validateDepartment(
+  input: any
+): { ok: boolean; error?: string; value?: Department | '' } {
+  if (input === undefined) return { ok: true };
+  if (input === null) return { ok: true, value: '' };
+  const raw = String(input).trim().toLowerCase();
+  if (raw === '') return { ok: true, value: '' };
+  if (!(DEPARTMENTS as readonly string[]).includes(raw)) {
+    return {
+      ok: false,
+      error: `department must be one of: ${DEPARTMENTS.join(', ')}`,
+    };
+  }
+  return { ok: true, value: raw as Department };
+}
+
+/**
+ * Validate designation input (free text).
+ * Returns normalized trimmed value, or '' if not provided.
+ */
+function validateDesignation(
+  input: any
+): { ok: boolean; error?: string; value?: string } {
+  if (input === undefined) return { ok: true };
+  if (input === null) return { ok: true, value: '' };
+  const v = String(input).trim();
+  if (v === '') return { ok: true, value: '' };
+  if (v.length > DESIGNATION_MAX_LENGTH) {
+    return {
+      ok: false,
+      error: `designation must be ≤ ${DESIGNATION_MAX_LENGTH} characters`,
+    };
+  }
+  return { ok: true, value: v };
 }
 
 // ─── Salary validation ────────────────────────────────────────────────────
@@ -115,20 +155,6 @@ function validateSalaryInput(
     parsed.overtimePerHourAmount = r.value;
   } else if (fallback?.overtimePerHourAmount !== undefined) {
     parsed.overtimePerHourAmount = fallback.overtimePerHourAmount;
-  }
-
-  // Cross-field: for a fixed employee basicSalary should be > 0, for
-  // piece-rate pieceRateSalary should be > 0. Only enforce when the
-  // structure itself is being set or the amount is being set.
-  const struct = parsed.salaryStructure ?? fallback?.salaryStructure;
-  const basic = parsed.basicSalary ?? fallback?.basicSalary;
-  const piece = parsed.pieceRateSalary ?? fallback?.pieceRateSalary;
-
-  if (struct === 'fixed' && typeof basic === 'number' && basic === 0) {
-    // Not an error — allow zero for now — but a caller could add a warning.
-  }
-  if (struct === 'piece_rate' && typeof piece === 'number' && piece === 0) {
-    // Not an error — allow zero for now.
   }
 
   return { ok: true, parsed };
@@ -341,7 +367,6 @@ export async function createEmployee(req: AuthRequest, res: Response): Promise<v
       username,
       email,
       password,
-      role: roleId,
       permissions,
       permissionMode,
     } = req.body;
@@ -365,6 +390,23 @@ export async function createEmployee(req: AuthRequest, res: Response): Promise<v
         success: false,
         message: `Missing required fields: ${missing.join(', ')}`,
       });
+      return;
+    }
+
+    // ── 1a. Validate department + designation ────────────────────────────
+    const deptRes = validateDepartment(department);
+    if (!deptRes.ok) {
+      res.status(400).json({ success: false, message: deptRes.error });
+      return;
+    }
+
+    const desigRes = validateDesignation(designation);
+    if (!desigRes.ok) {
+      res.status(400).json({ success: false, message: desigRes.error });
+      return;
+    }
+    if (!desigRes.value) {
+      res.status(400).json({ success: false, message: 'designation is required' });
       return;
     }
 
@@ -470,33 +512,6 @@ export async function createEmployee(req: AuthRequest, res: Response): Promise<v
         }
       }
 
-      let roleDoc: any = null;
-      if (roleId) {
-        roleDoc = await Role.findOne({
-          _id: roleId,
-          isDeleted: false,
-          isActive: true,
-        });
-        if (!roleDoc) {
-          res.status(400).json({ success: false, message: 'Invalid role' });
-          return;
-        }
-        if (department) {
-          const hasDept = roleDoc.departments.some(
-            (d: any) =>
-              d.name.trim().toLowerCase() ===
-              String(department).trim().toLowerCase()
-          );
-          if (!hasDept) {
-            res.status(400).json({
-              success: false,
-              message: `Department "${department}" is not defined in role "${roleDoc.name}"`,
-            });
-            return;
-          }
-        }
-      }
-
       const user = new User({
         name: String(name).trim(),
         username: normalizedUsername,
@@ -506,12 +521,11 @@ export async function createEmployee(req: AuthRequest, res: Response): Promise<v
         gender,
         cnic,
         phoneNo,
-        designation,
+        designation: desigRes.value,
         dateOfJoining,
         address: address || undefined,
         profileImage: profileImage || null,
-        role: roleId || null,
-        department: department || '',
+        department: deptRes.value ?? '',
         permissions: permissions || [],
         permissionMode: permissionMode || 'override',
         status: 'active',
@@ -521,7 +535,7 @@ export async function createEmployee(req: AuthRequest, res: Response): Promise<v
         createdBy: req.user!._id,
       });
 
-        await user.save(); // hook auto-creates Employee
+      await user.save(); // hook auto-creates Employee
 
       // Poll briefly — Mongoose does NOT await post('save') hooks,
       // so the Employee record may not exist yet.
@@ -574,9 +588,9 @@ export async function createEmployee(req: AuthRequest, res: Response): Promise<v
       gender,
       cnic,
       phoneNo,
-      designation,
+      designation: desigRes.value,
       dateOfJoining,
-      department: department || '',
+      department: deptRes.value ?? '',
       address: address || undefined,
       profileImage: profileImage || null,
 
@@ -638,7 +652,7 @@ export async function listEmployees(req: AuthRequest, res: Response): Promise<vo
 
     const filter: any = { isDeleted: false };
 
-    if (department) filter.department = department;
+    if (department) filter.department = String(department).trim().toLowerCase();
     if (designation) filter.designation = designation;
     if (isActive !== undefined) filter.isActive = isActive === 'true';
 
@@ -675,6 +689,7 @@ export async function listEmployees(req: AuthRequest, res: Response): Promise<vo
         { employeeId: { $regex: search, $options: 'i' } },
         { cnic: { $regex: search, $options: 'i' } },
         { phoneNo: { $regex: search, $options: 'i' } },
+        { designation: { $regex: search, $options: 'i' } },
         { standardCheckIn: { $regex: search, $options: 'i' } },
         { standardCheckOut: { $regex: search, $options: 'i' } },
       ];
@@ -688,7 +703,7 @@ export async function listEmployees(req: AuthRequest, res: Response): Promise<vo
       Employee.find(filter)
         .populate(
           'user',
-          'username status isActive isEmailVerified role department'
+          'username status isActive isEmailVerified department'
         )
         .sort(sort as string)
         .skip(skip)
@@ -725,7 +740,7 @@ export async function getEmployee(req: AuthRequest, res: Response): Promise<void
 
     const employee = await Employee.findOne(query).populate(
       'user',
-      'username status isActive isEmailVerified role department permissions permissionMode isMainAdmin'
+      'username status isActive isEmailVerified department permissions permissionMode isMainAdmin'
     );
 
     if (!employee) {
@@ -767,7 +782,7 @@ export async function getEmployeeByUserId(req: AuthRequest, res: Response): Prom
       isDeleted: false,
     }).populate(
       'user',
-      'username status isActive isEmailVerified role department'
+      'username status isActive isEmailVerified department'
     );
 
     if (!employee) {
@@ -961,7 +976,6 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
         dateOfJoining: employee.dateOfJoining,
         address: employee.address,
         profileImage: employee.profileImage ?? null,
-        role: null,
         department: employee.department || '',
         permissions: [],
         permissionMode: 'override',
@@ -1077,6 +1091,19 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
       }
     }
 
+    // ── Validate department + designation ────────────────────────────────
+    const deptRes = validateDepartment(department);
+    if (!deptRes.ok) {
+      res.status(400).json({ success: false, message: deptRes.error });
+      return;
+    }
+
+    const desigRes = validateDesignation(designation);
+    if (!desigRes.ok) {
+      res.status(400).json({ success: false, message: desigRes.error });
+      return;
+    }
+
     const timingError = validateTimings(
       standardCheckIn !== undefined ? standardCheckIn : employee.standardCheckIn,
       standardCheckOut !== undefined ? standardCheckOut : employee.standardCheckOut
@@ -1167,29 +1194,6 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
       }
     }
 
-    if (
-      department !== undefined &&
-      linkedUser &&
-      department !== linkedUser.department &&
-      linkedUser.role
-    ) {
-      const roleDoc: any = await Role.findById(linkedUser.role);
-      if (roleDoc) {
-        const hasDept = roleDoc.departments?.some(
-          (d: any) =>
-            d.name.trim().toLowerCase() ===
-            String(department).trim().toLowerCase()
-        );
-        if (!hasDept) {
-          res.status(400).json({
-            success: false,
-            message: `Department "${department}" is not defined in role "${roleDoc.name}"`,
-          });
-          return;
-        }
-      }
-    }
-
     // ── Apply changes ───────────────────────────────────────────────────
     if (name !== undefined) employee.name = name;
     if (phoneNo !== undefined) employee.phoneNo = phoneNo;
@@ -1198,8 +1202,12 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
     if (gender !== undefined) employee.gender = gender;
     if (dob !== undefined) employee.dob = dob;
     if (cnic !== undefined) employee.cnic = cnic;
-    if (designation !== undefined) employee.designation = designation;
-    if (department !== undefined) employee.department = department;
+    if (designation !== undefined && desigRes.value !== undefined) {
+      employee.designation = desigRes.value;
+    }
+    if (department !== undefined && deptRes.value !== undefined) {
+      employee.department = deptRes.value;
+    }
     if (dateOfJoining !== undefined) employee.dateOfJoining = dateOfJoining;
     if (profileImage !== undefined) employee.profileImage = profileImage;
 
@@ -1255,8 +1263,12 @@ export async function updateEmployee(req: AuthRequest, res: Response): Promise<v
       if (gender !== undefined) mirrored.gender = gender;
       if (dob !== undefined) mirrored.dob = dob;
       if (cnic !== undefined) mirrored.cnic = cnic;
-      if (designation !== undefined) mirrored.designation = designation;
-      if (department !== undefined) mirrored.department = department;
+      if (designation !== undefined && desigRes.value !== undefined) {
+        mirrored.designation = desigRes.value;
+      }
+      if (department !== undefined && deptRes.value !== undefined) {
+        mirrored.department = deptRes.value;
+      }
       if (profileImage !== undefined) mirrored.profileImage = profileImage;
 
       if (Object.keys(mirrored).length) {
