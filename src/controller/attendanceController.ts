@@ -1213,10 +1213,18 @@ export async function getEmployeeMonthlyAttendance(
    AUTO CHECK-IN / CHECK-OUT
    ══════════════════════════════════════════════════════════════ */
 
+// controller/attendanceController.ts
+
 /**
  * POST /attendance/check-in
- * Called after successful login. Only the FIRST call of the day
- * creates the record; every other call is a no-op.
+ * Called after successful login OR on dashboard mount / session restore.
+ *
+ * IMPORTANT: This must be idempotent — it should NEVER overwrite the
+ * arrivalAt that was set at the actual login moment. The login() function
+ * in authController is responsible for the authoritative arrival time.
+ *
+ * - If no record exists today → create it (arrivalAt = now, source='auto')
+ * - If a record exists today → return it UNCHANGED (no arrivalAt update)
  */
 export async function checkIn(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -1225,9 +1233,12 @@ export async function checkIn(req: AuthRequest, res: Response): Promise<void> {
       return;
     }
 
-    const result = await markAttendanceFromAuth(req.user._id, 'login');
+    const emp = await Employee.findOne({
+      user: req.user._id,
+      isDeleted: false,
+    });
 
-    if (result.reason === 'no-employee') {
+    if (!emp) {
       res.status(404).json({
         success: false,
         message: 'No employee record linked to your account',
@@ -1235,28 +1246,71 @@ export async function checkIn(req: AuthRequest, res: Response): Promise<void> {
       return;
     }
 
-    res.json({
-      success: true,
-      action: result.action,
-      reason: result.reason,
-      data: result.record,
-    });
-  } catch (err: any) {
-    // Race: two simultaneous logins both saw "no row" and both tried
-    // to insert. Unique index rejects the second. Return the winner.
-    if (err?.code === 11000) {
-      try {
-        const emp = await Employee.findOne({
-          user: req.user!._id,
-          isDeleted: false,
-        });
-        const rec = emp
-          ? await Attendance.findOne({
-              employee: emp._id,
-              date: normalizeDate(new Date()),
-            })
-          : null;
+    const today = normalizeDate(new Date());
 
+    // ── 1. Does a record already exist for today? ──────────────────────
+    const existing = await Attendance.findOne({
+      employee: emp._id,
+      date: today,
+    });
+
+    if (existing && !existing.isDeleted) {
+      // Never overwrite. The arrivalAt set during login() is the truth.
+      res.json({
+        success: true,
+        action: 'skipped',
+        reason: 'already-marked-today',
+        data: existing,
+      });
+      return;
+    }
+
+    // ── 2. Build a fresh record for today ──────────────────────────────
+    const now = new Date();
+
+    // Respect weekends / holidays the same way the rest of the code does
+    const weekend = isWeekend(today);
+    const holidays = await Holiday.forDate(today);
+    const isHoliday = holidays.length > 0;
+
+    // Determine status. If it's a weekend/holiday, mark it and don't
+    // pretend the person "arrived" — but still record arrivalAt so the
+    // dashboard shows their real login time.
+    let status: AttendanceStatus;
+    if (isHoliday) status = 'holiday';
+    else if (weekend) status = 'weekend';
+    else status = deriveStatus(today, now, null);
+
+    const payload = {
+      employee: emp._id,
+      user: emp.user || null,
+      employeeId: emp.employeeId,
+      employeeName: emp.name,
+      department: emp.department || '',
+      date: today,
+      arrivalAt: now,
+      departureAt: null,
+      workedHours: 0,
+      status,
+      source: 'auto' as const,
+      markedBy: null,
+      isDeleted: false,
+    };
+
+    let rec: any;
+    try {
+      rec = await Attendance.findOneAndUpdate(
+        { employee: emp._id, date: today },
+        { $setOnInsert: payload },
+        { new: true, upsert: true, setDefaultsOnInsert: true }
+      );
+    } catch (err: any) {
+      // Race: two requests both saw "no row" and both tried to insert.
+      if (err?.code === 11000) {
+        rec = await Attendance.findOne({
+          employee: emp._id,
+          date: today,
+        });
         res.json({
           success: true,
           action: 'skipped',
@@ -1264,19 +1318,27 @@ export async function checkIn(req: AuthRequest, res: Response): Promise<void> {
           data: rec,
         });
         return;
-      } catch {
-        /* fall through to 500 */
       }
+      throw err;
     }
+
+    res.json({
+      success: true,
+      action: 'created',
+      reason: 'first-mark-of-day',
+      data: rec,
+    });
+  } catch (err: any) {
     console.error('checkIn error:', err);
     res.status(500).json({ success: false, message: err.message });
   }
 }
+// controller/attendanceController.ts
 
 /**
  * POST /attendance/check-out
  * Called on logout. Updates departureAt, workedHours, status.
- * Never touches arrivalAt.
+ * NEVER touches arrivalAt.
  */
 export async function checkOut(req: AuthRequest, res: Response): Promise<void> {
   try {
@@ -1285,9 +1347,12 @@ export async function checkOut(req: AuthRequest, res: Response): Promise<void> {
       return;
     }
 
-    const result = await markAttendanceFromAuth(req.user._id, 'logout');
+    const emp = await Employee.findOne({
+      user: req.user._id,
+      isDeleted: false,
+    });
 
-    if (result.reason === 'no-employee') {
+    if (!emp) {
       res.status(404).json({
         success: false,
         message: 'No employee record linked to your account',
@@ -1295,11 +1360,59 @@ export async function checkOut(req: AuthRequest, res: Response): Promise<void> {
       return;
     }
 
+    const today = normalizeDate(new Date());
+
+    const rec = await Attendance.findOne({
+      employee: emp._id,
+      date: today,
+      isDeleted: false,
+    });
+
+    // No check-in today → nothing to check out from. Don't fabricate one,
+    // because that would set arrivalAt = null and lose the login time.
+    if (!rec) {
+      res.json({
+        success: true,
+        action: 'skipped',
+        reason: 'no-check-in-today',
+        data: null,
+      });
+      return;
+    }
+
+    // Already checked out → no-op (don't move departureAt later)
+    if (rec.departureAt) {
+      res.json({
+        success: true,
+        action: 'skipped',
+        reason: 'already-checked-out',
+        data: rec,
+      });
+      return;
+    }
+
+    const now = new Date();
+    rec.departureAt = now;
+    rec.workedHours = computeWorkedHours(rec.arrivalAt, now);
+
+    // Only re-derive status for normal working days; don't clobber
+    // 'leave' / 'holiday' / 'weekend' / 'wfh'.
+    if (
+      rec.status !== 'leave' &&
+      rec.status !== 'holiday' &&
+      rec.status !== 'weekend' &&
+      rec.status !== 'wfh'
+    ) {
+      rec.status = deriveStatus(rec.date, rec.arrivalAt, now);
+    }
+
+    await rec.save();
+
     res.json({
       success: true,
-      action: result.action,
-      reason: result.reason,
-      data: result.record,
+      action: 'updated',
+      reason: 'checked-out',
+      data: rec,
     });
   } catch (err: any) {
     console.error('checkOut error:', err);

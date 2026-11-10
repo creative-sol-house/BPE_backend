@@ -2,7 +2,7 @@
 import mongoose, { Document, Schema, Types, Model } from 'mongoose';
 
 export type AttendanceStatus =
-  | 'present' | 'absent' | 'late' | 'half_day' | 'leave'
+  | 'present' | 'absent' | 'late' | 'half_day' | 'leave' 
   | 'holiday' | 'weekend'
   | 'wfh';                       // ← add
 
