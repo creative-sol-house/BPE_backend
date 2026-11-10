@@ -131,10 +131,7 @@ function atTimeOnDate(dateUtcMidnight: Date, hhmm: string): Date {
   );
 }
 
-/** Slot at index i from the anchor. */
-function slotAt(anchor: Date, intervalMin: number, i: number): Date {
-  return new Date(anchor.getTime() + i * intervalMin * 60_000);
-}
+
 
 /** Is `t` strictly inside any break interval? (open breaks use `nowMs`) */
 function insideAnyBreak(breaks: IBreakInterval[], t: Date, nowMs: number): boolean {
@@ -452,19 +449,26 @@ AttendanceSessionSchema.statics.checkIn = async function (
 
   // Finalize anything already expired first
   await this.backfillMissedSlots(userId);
+const fresh = await this.findById(session._id);
+if (!fresh) {
+  throw Object.assign(new Error('Session vanished'), { status: 404 });
+}
+// Narrow the nullable anchor — TS needs this even though `session`
+// was already checked, because `findById` re-types it as `Date | null`.
+if (!fresh.scheduledStartAt) {
+  throw Object.assign(new Error('Session has no schedule anchor'), {
+    status: 409,
+  });
+}
+const anchorMs = new Date(fresh.scheduledStartAt).getTime();
 
-  const fresh = await this.findById(session._id);
-  if (!fresh) {
-    throw Object.assign(new Error('Session vanished'), { status: 404 });
-  }
+const intervalMs =
+  (fresh.scheduleIntervalMin || SLOT_INTERVAL_MIN) * 60_000;
+const graceMs = GRACE_MIN * 60_000;
+const nowMs = Date.now();
 
-  const intervalMs =
-    (fresh.scheduleIntervalMin || SLOT_INTERVAL_MIN) * 60_000;
-  const graceMs = GRACE_MIN * 60_000;
-  const nowMs = Date.now();
-
-  // Find the slot whose grace window contains "now"
-  let cursor = new Date(fresh.scheduledStartAt).getTime();
+// Find the slot whose grace window contains "now"
+let cursor = anchorMs;
   let openSlot: Date | null = null;
   const maxSlots = Math.ceil(
     (24 * 60) / (fresh.scheduleIntervalMin || SLOT_INTERVAL_MIN)
