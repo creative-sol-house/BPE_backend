@@ -78,10 +78,7 @@ function isWeekend(d: Date): boolean {
   return dow === 0 || dow === 6;
 }
 
-/** Slot at index i (0-based) from scheduledStartAt */
-function slotAt(scheduledStartAt: Date, intervalMin: number, i: number): Date {
-  return new Date(scheduledStartAt.getTime() + i * intervalMin * 60_000);
-}
+
 
 /** Is `t` strictly inside any break? */
 function insideAnyBreak(breaks: IBreakInterval[], t: Date, nowMs: number): boolean {
